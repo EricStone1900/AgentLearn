@@ -1,0 +1,27 @@
+{
+  "name": "agent-patterns-ts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "demo:llm": "tsx src/examples/llm-client-demo.ts",
+    "demo:react": "tsx src/examples/react-demo.ts",
+    "demo:plan": "tsx src/examples/plan-and-solve-demo.ts",
+    "demo:reflection": "tsx src/examples/reflection-demo.ts"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "openai": "^7.4.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  }
+}
