@@ -14,7 +14,8 @@
     "demo:reflection": "tsx src/examples/reflection-demo.ts",
     "demo:my-llm": "tsx src/examples/my-llm-demo.ts",
     "demo:simple": "tsx src/examples/simple-agent-demo.ts",
-    "demo:function-call": "tsx src/examples/function-call-agent-demo.ts"
+    "demo:function-call": "tsx src/examples/function-call-agent-demo.ts",
+    "demo:tools": "tsx src/examples/tool-system-demo.ts"
   },
   "dependencies": {
     "dotenv": "^17.4.2",

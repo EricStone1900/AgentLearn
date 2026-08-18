@@ -94,7 +94,7 @@ export class ReActAgent extends Agent {
     // const systemPrompt = createReActSystemPrompt(this.tools.describe());
     const systemPrompt = [
       this.systemPrompt,
-      createReActSystemPrompt(this.tools.describe()),
+      createReActSystemPrompt(this.tools.describeWithSchemas()),
     ]
       .filter((content): content is string => Boolean(content))
       .join("\n\n");

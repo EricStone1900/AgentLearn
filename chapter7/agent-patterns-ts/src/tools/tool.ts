@@ -8,60 +8,119 @@ export interface Tool<TInput = unknown> {
   execute(input: TInput): Promise<string>;
 }
 
+export type ToolExecutionResult =
+  | {
+      ok: true;
+      output: string;
+    }
+  | {
+      ok: false;
+      output: string;
+      error: string;
+    };
+
+export interface FunctionToolOptions<TInput> {
+  name: string;
+  description: string;
+  inputSchema: ZodType<TInput>;
+  handler(input: TInput): Promise<string> | string;
+}
+
+interface RegisteredTool {
+  name: string;
+  description: string;
+  inputSchema: ZodType;
+
+  run(input: unknown): Promise<ToolExecutionResult>;
+}
+
 export class ToolRegistry {
-  /*
-   * 注册表中会同时存放多种工具。
-   *
-   * 例如：
-   * Tool<CalculatorInput>
-   * Tool<SearchInput>
-   *
-   * 它们的输入类型各不相同，因此在注册表内部做统一存储。
-   * 真正执行前仍会通过每个工具自己的 Zod Schema 进行校验。
-   */
-  private readonly tools = new Map<string, Tool<any>>();
+  private readonly tools = new Map<string, RegisteredTool>();
 
   public register<TInput>(tool: Tool<TInput>): void {
     if (this.tools.has(tool.name)) {
       throw new Error(`工具已经存在：${tool.name}`);
     }
 
-    this.tools.set(tool.name, tool);
+    const registeredTool: RegisteredTool = {
+      name: tool.name,
+      description: tool.description,
+      inputSchema: tool.inputSchema,
+
+      async run(input: unknown): Promise<ToolExecutionResult> {
+        const parsed = tool.inputSchema.safeParse(input);
+
+        if (!parsed.success) {
+          const error = z.prettifyError(parsed.error);
+
+          return {
+            ok: false,
+            error,
+            output: [`错误：工具 "${tool.name}" 的参数不合法。`, error].join(
+              "\n",
+            ),
+          };
+        }
+
+        try {
+          const output = await tool.execute(parsed.data);
+
+          return {
+            ok: true,
+            output,
+          };
+        } catch (error: unknown) {
+          const message =
+            error instanceof Error ? error.message : String(error);
+
+          return {
+            ok: false,
+            error: message,
+            output: `错误：工具 "${tool.name}" 执行失败：${message}`,
+          };
+        }
+      },
+    };
+
+    this.tools.set(tool.name, registeredTool);
   }
 
-  public describe(): string {
-    if (this.tools.size === 0) {
-      return "当前没有可用工具";
-    }
+  public registerFunction<TInput>(options: FunctionToolOptions<TInput>): void {
+    const tool: Tool<TInput> = {
+      name: options.name,
+      description: options.description,
+      inputSchema: options.inputSchema,
 
-    return [...this.tools.values()]
-      .map((tool) => `- ${tool.name}: ${tool.description}`)
-      .join("\n");
+      async execute(input) {
+        return options.handler(input);
+      },
+    };
+
+    this.register(tool);
   }
 
-  public async execute(name: string, input: unknown): Promise<string> {
+  public async executeDetailed(
+    name: string,
+    input: unknown,
+  ): Promise<ToolExecutionResult> {
     const tool = this.tools.get(name);
 
     if (!tool) {
-      return `错误：不存在名为 "${name}" 的工具`;
+      const error = `不存在名为 "${name}" 的工具`;
+
+      return {
+        ok: false,
+        error,
+        output: `错误：${error}`,
+      };
     }
 
-    const parsed = tool.inputSchema.safeParse(input);
+    return tool.run(input);
+  }
+  public async execute(name: string, input: unknown): Promise<string> {
+    const result = await this.executeDetailed(name, input);
 
-    if (!parsed.success) {
-      return [
-        `错误：工具 "${name}" 的参数不合法。`,
-        z.prettifyError(parsed.error),
-      ].join("\n");
-    }
-
-    try {
-      return await tool.execute(parsed.data);
-    } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : String(error);
-
-      return `错误：工具 "${name}" 执行失败：${message}`;
-    }
+    return result.output;
   }
 
   public get size(): number {
@@ -76,19 +135,63 @@ export class ToolRegistry {
     return this.tools.delete(name);
   }
 
+  public clear(): void {
+    this.tools.clear();
+  }
+
   public listNames(): string[] {
     return [...this.tools.keys()];
+  }
+
+  public describe(): string {
+    if (this.tools.size === 0) {
+      return "当前没有可用工具";
+    }
+
+    return [...this.tools.values()]
+      .map((tool) => {
+        return `- ${tool.name}: ${tool.description}`;
+      })
+      .join("\n");
+  }
+
+  public describeWithSchemas(): string {
+    if (this.tools.size === 0) {
+      return "当前没有可用工具";
+    }
+
+    return [...this.tools.values()]
+      .map((tool) => {
+        const schema = z.toJSONSchema(tool.inputSchema);
+        const { $schema: _schema, ...parameters } = schema;
+
+        return [
+          `- ${tool.name}: ${tool.description}`,
+          `  参数：${JSON.stringify(parameters)}`,
+        ].join("\n");
+      })
+      .join("\n");
   }
 
   public toOpenAiTools(): ChatCompletionTool[] {
     return [...this.tools.values()].map((tool) => {
       const jsonSchema = z.toJSONSchema(tool.inputSchema);
 
-      /*
-       * OpenAI 只需要参数 Schema，
-       * 不需要 Zod 生成的顶层 $schema 字段。
-       */
       const { $schema: _schema, ...parameters } = jsonSchema;
+
+      /*
+       * Function Calling 要求 parameters
+       * 顶层必须是 JSON object。
+       */
+      if (parameters.type !== "object") {
+        throw new Error(
+          [
+            `工具 "${tool.name}" 无法转换为 Function Calling Schema。`,
+            "工具 inputSchema 顶层必须使用 z.object()。",
+            `当前顶层类型：${String(parameters.type ?? "undefined")}`,
+          ].join("\n"),
+        );
+      }
 
       return {
         type: "function",

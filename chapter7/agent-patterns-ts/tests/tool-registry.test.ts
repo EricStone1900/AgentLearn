@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { calculatorTool } from "../src/tools/calculator.js";
 import { ToolRegistry } from "../src/tools/tool.js";
+import { z } from "zod";
 
 describe("ToolRegistry", () => {
   it("可以注册并执行计算器工具", async () => {
@@ -61,5 +62,58 @@ describe("ToolRegistry", () => {
     expect(() => {
       registry.register(calculatorTool);
     }).toThrow("工具已经存在");
+  });
+
+  it("可以直接注册函数工具", async () => {
+    const registry = new ToolRegistry();
+
+    registry.registerFunction({
+      name: "uppercase",
+      description: "将文本转换为大写",
+
+      inputSchema: z.object({
+        text: z.string().min(1),
+      }),
+
+      handler({ text }) {
+        return text.toUpperCase();
+      },
+    });
+
+    const result = await registry.execute("uppercase", {
+      text: "hello",
+    });
+
+    expect(result).toBe("HELLO");
+  });
+
+  it("executeDetailed 能够返回结构化错误", async () => {
+    const registry = new ToolRegistry();
+
+    const result = await registry.executeDetailed("unknown", {});
+
+    expect(result.ok).toBe(false);
+
+    if (!result.ok) {
+      expect(result.error).toContain("不存在");
+    }
+  });
+
+  it("能够查询、删除和清空工具", () => {
+    const registry = new ToolRegistry();
+
+    registry.register(calculatorTool);
+
+    expect(registry.has("calculator")).toBe(true);
+    expect(registry.listNames()).toEqual(["calculator"]);
+    expect(registry.size).toBe(1);
+
+    expect(registry.unregister("calculator")).toBe(true);
+    expect(registry.has("calculator")).toBe(false);
+
+    registry.register(calculatorTool);
+    registry.clear();
+
+    expect(registry.size).toBe(0);
   });
 });
