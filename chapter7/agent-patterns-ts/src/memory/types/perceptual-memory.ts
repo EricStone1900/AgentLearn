@@ -1,28 +1,91 @@
-// export const modalitySchema = z.enum(["text", "image", "audio", "video"]);
+import { z } from "zod";
+import type { MemorySearchOptions } from "../base.js";
+import type { EmbeddingClient } from "../embedding.js";
+import { importanceWeight, recencyScore } from "../scoring.js";
+import type { MemoryItem, MemorySearchResult } from "../schemas.js";
+import type { DocumentStore } from "../storage/document-store.js";
+import type { VectorStore } from "../storage/vector-store.js";
+import { StoredMemory } from "./stored-memory.js";
 
-// export type Modality = z.infer<typeof modalitySchema>;
+export const modalitySchema = z.enum(["text", "image", "audio", "video"]);
+export type Modality = z.infer<typeof modalitySchema>;
 
-// export class PerceptualMemory extends BaseMemory {
-//   public readonly type = "perceptual" as const;
+export interface PerceptualSearchOptions extends MemorySearchOptions {
+  targetModality?: Modality;
+}
 
-//   public async add(item: MemoryItem): Promise<string> {
-//     // TODO:
-//     // 1. 验证 metadata.modality
-//     // 2. 文档库存描述和资源信息
-//     // 3. 选择对应的模态编码器
-//     // 4. 写入对应的向量集合
-//     throw new Error("TODO");
-//   }
+// Perceptual Memory 感知记忆
+// 图像声音等
+export class PerceptualMemory extends StoredMemory {
+  public readonly type = "perceptual" as const;
 
-//   public async retrieve(
-//     query: string,
-//     options = {},
-//   ): Promise<MemorySearchResult[]> {
-//     // TODO:
-//     // 1. 确定 queryModality 和 targetModality
-//     // 2. 获取相应编码器和向量库
-//     // 3. 同模态向量检索
-//     // 4. 融合时间与重要性
-//     throw new Error("TODO");
-//   }
-// }
+  public constructor(
+    documents: DocumentStore,
+    vectors: VectorStore,
+    embeddings: EmbeddingClient,
+    private readonly now: () => Date = () => new Date(),
+  ) {
+    super(documents, vectors, embeddings);
+  }
+
+  public async add(item: MemoryItem): Promise<string> {
+    modalitySchema.parse(item.metadata.modality);
+    return this.storeItem(item);
+  }
+
+  public async retrieve(
+    query: string,
+    options: PerceptualSearchOptions = {},
+  ): Promise<MemorySearchResult[]> {
+    if (!query.trim()) throw new Error("感知记忆查询不能为空");
+
+    const limit = options.limit ?? 5;
+    const hits = await this.searchVectorCandidates(
+      query,
+      options,
+      options.targetModality,
+    );
+    const results: MemorySearchResult[] = [];
+
+    for (const hit of hits) {
+      const item = await this.documents.get(hit.id);
+      if (!item || item.memoryType !== this.type) continue;
+      if (!this.matchesOptions(item, options)) continue;
+      if (
+        options.targetModality &&
+        item.metadata.modality !== options.targetModality
+      ) {
+        continue;
+      }
+
+      const recency = recencyScore(item.timestamp, this.now());
+      const relevance = hit.score * 0.8 + recency * 0.2;
+      const score = relevance * importanceWeight(item.importance);
+
+      results.push({
+        item,
+        score,
+        signals: {
+          relevance,
+          vector: hit.score,
+          recency,
+          importance: item.importance,
+        },
+      });
+    }
+
+    return results.sort((left, right) => right.score - left.score).slice(0, limit);
+  }
+
+  public async getByModality(
+    userId: string,
+    modality: Modality,
+    limit = 10,
+  ): Promise<MemoryItem[]> {
+    modalitySchema.parse(modality);
+    const items = await this.getAll(userId);
+    return items
+      .filter((item) => item.metadata.modality === modality)
+      .slice(0, limit);
+  }
+}

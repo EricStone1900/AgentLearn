@@ -15,7 +15,9 @@
     "demo:my-llm": "tsx src/examples/my-llm-demo.ts",
     "demo:simple": "tsx src/examples/simple-agent-demo.ts",
     "demo:function-call": "tsx src/examples/function-call-agent-demo.ts",
-    "demo:tools": "tsx src/examples/tool-system-demo.ts"
+    "demo:tools": "tsx src/examples/tool-system-demo.ts",
+    "demo:memory:function": "tsx src/examples/memory-function-call-demo.ts",
+    "demo:memory:tool": "tsx src/examples/memory-simple-agent-demo.ts"
   },
   "dependencies": {
     "dotenv": "^17.4.2",

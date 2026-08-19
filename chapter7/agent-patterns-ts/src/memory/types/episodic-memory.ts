@@ -1,51 +1,94 @@
-// import { BaseMemory } from "../base.js";
+import type { MemorySearchOptions } from "../base.js";
+import type { EmbeddingClient } from "../embedding.js";
+import {
+  importanceWeight,
+  recencyScore,
+} from "../scoring.js";
+import type {
+  MemoryItem,
+  MemorySearchResult,
+} from "../schemas.js";
+import type { DocumentStore } from "../storage/document-store.js";
+import type { VectorStore } from "../storage/vector-store.js";
+import { StoredMemory } from "./stored-memory.js";
 
-// export class EpisodicMemory extends BaseMemory {
-//   public readonly type = "episodic" as const;
+// Episodic Memory 情景记忆
+// 存储个人经历、事件、感受等与特定时间、地点相关的记忆
+export class EpisodicMemory extends StoredMemory {
+  public readonly type = "episodic" as const;
 
-//   public constructor(
-//     private readonly documents: DocumentStore,
-//     private readonly vectors: VectorStore,
-//     private readonly embeddings: EmbeddingClient,
-//   ) {
-//     super();
-//   }
+  public constructor(
+    documents: DocumentStore,
+    vectors: VectorStore,
+    embeddings: EmbeddingClient,
+    private readonly now: () => Date = () => new Date(),
+  ) {
+    super(documents, vectors, embeddings);
+  }
 
-//   public async add(item: MemoryItem): Promise<string> {
-//     // TODO:
-//     // 1. 验证 memoryType
-//     // 2. 写入 DocumentStore
-//     // 3. 对 content 生成 embedding
-//     // 4. 将向量和必要元数据写入 VectorStore
-//     // 5. 如果步骤 3/4 失败，考虑回滚文档存储
-//     throw new Error("TODO");
-//   }
+  public async add(item: MemoryItem): Promise<string> {
+    return this.storeItem(item);
+  }
 
-//   public async retrieve(
-//     query: string,
-//     options = {},
-//   ): Promise<MemorySearchResult[]> {
-//     // TODO:
-//     // 1. 对查询生成向量
-//     // 2. 根据 userId 和 memoryType 搜索候选
-//     // 3. 从 DocumentStore 获取完整数据
-//     // 4. 应用时间范围、importance 等结构化过滤
-//     // 5. 计算：
-//     //    (vector * 0.8 + recency * 0.2) * importanceWeight
-//     // 6. 排序并截取 limit
-//     throw new Error("TODO");
-//   }
+  public async retrieve(
+    query: string,
+    options: MemorySearchOptions = {},
+  ): Promise<MemorySearchResult[]> {
+    if (!query.trim()) throw new Error("情景记忆查询不能为空");
 
-//   public async getTimeline(userId: string, limit = 50): Promise<MemoryItem[]> {
-//     // TODO: 按 timestamp 降序获取事件
-//     throw new Error("TODO");
-//   }
+    const limit = options.limit ?? 5;
+    const hits = await this.searchVectorCandidates(query, options);
+    const results: MemorySearchResult[] = [];
 
-//   public async getSessionEpisodes(
-//     userId: string,
-//     sessionId: string,
-//   ): Promise<MemoryItem[]> {
-//     // TODO: 根据 metadata.sessionId 过滤
-//     throw new Error("TODO");
-//   }
-// }
+    for (const hit of hits) {
+      const item = await this.documents.get(hit.id);
+      if (!item || item.memoryType !== this.type) continue;
+      if (!this.matchesOptions(item, options)) continue;
+
+      const recency = recencyScore(item.timestamp, this.now());
+      const relevance = hit.score * 0.8 + recency * 0.2;
+      const score = relevance * importanceWeight(item.importance);
+
+      results.push({
+        item,
+        score,
+        signals: {
+          relevance,
+          vector: hit.score,
+          recency,
+          importance: item.importance,
+        },
+      });
+    }
+
+    return results.sort((left, right) => right.score - left.score).slice(0, limit);
+  }
+
+  public async getTimeline(
+    userId: string,
+    limit = 50,
+  ): Promise<MemoryItem[]> {
+    const items = await this.documents.list({
+      userId,
+      memoryType: this.type,
+    });
+
+    return items
+      .sort((left, right) => right.timestamp.localeCompare(left.timestamp))
+      .slice(0, limit);
+  }
+
+  public async getSessionEpisodes(
+    userId: string,
+    sessionId: string,
+  ): Promise<MemoryItem[]> {
+    const items = await this.documents.list({
+      userId,
+      memoryType: this.type,
+    });
+
+    return items
+      .filter((item) => item.metadata.sessionId === sessionId)
+      .sort((left, right) => left.timestamp.localeCompare(right.timestamp));
+  }
+}

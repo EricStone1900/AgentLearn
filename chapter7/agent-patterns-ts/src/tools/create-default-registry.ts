@@ -1,12 +1,13 @@
+import type { MemoryManager } from "../memory/manager.js";
 import { advancedCalculatorTool } from "./advanced-calculator.js";
-
+import { createMemoryTool } from "./memory-tool.js";
 import { createHybridSearchToolFromEnv } from "./search/hybrid-search.js";
-
 import { ToolRegistry } from "./tool.js";
 
 export interface CreateDefaultToolRegistryOptions {
   env?: NodeJS.ProcessEnv;
   includeSearch?: boolean;
+  memoryManager?: MemoryManager;
 }
 
 /**
@@ -19,28 +20,21 @@ export function createDefaultToolRegistry(
   options: CreateDefaultToolRegistryOptions = {},
 ): ToolRegistry {
   const env = options.env ?? process.env;
-
   const includeSearch = options.includeSearch ?? true;
-
   const registry = new ToolRegistry();
 
-  /*
-   * 数学工具不依赖外部服务，始终注册。
-   */
   registry.register(advancedCalculatorTool);
 
-  /*
-   * 搜索工具依赖 API Key。
-   *
-   * 只要 Tavily 或 SerpAPI 中至少配置一个，
-   * 就可以注册混合搜索工具。
-   */
   const hasSearchApiKey = Boolean(
     env.TAVILY_API_KEY?.trim() || env.SERPAPI_API_KEY?.trim(),
   );
 
   if (includeSearch && hasSearchApiKey) {
     registry.register(createHybridSearchToolFromEnv(env));
+  }
+
+  if (options.memoryManager) {
+    registry.register(createMemoryTool(options.memoryManager));
   }
 
   return registry;
