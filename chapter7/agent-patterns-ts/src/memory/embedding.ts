@@ -5,7 +5,11 @@ export interface EmbeddingClient {
 }
 
 function tokens(text: string): string[] {
-  return text.toLowerCase().match(/[\p{Script=Han}]|[\p{L}\p{N}_]+/gu) ?? [];
+  return (
+    text
+      .toLowerCase()
+      .match(/[\p{Script=Han}]|[\p{Script=Latin}\p{N}_+-]+/gu) ?? []
+  );
 }
 
 function stableHash(value: string): number {

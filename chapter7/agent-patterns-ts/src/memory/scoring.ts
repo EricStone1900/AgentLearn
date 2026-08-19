@@ -3,7 +3,11 @@ function clamp(value: number, minimum = 0, maximum = 1): number {
 }
 
 function tokenize(text: string): string[] {
-  return text.toLowerCase().match(/[\p{Script=Han}]|[\p{L}\p{N}_]+/gu) ?? [];
+  return (
+    text
+      .toLowerCase()
+      .match(/[\p{Script=Han}]|[\p{Script=Latin}\p{N}_+-]+/gu) ?? []
+  );
 }
 
 export function importanceWeight(importance: number): number {
