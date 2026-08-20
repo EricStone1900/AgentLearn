@@ -5,13 +5,11 @@ import {
   type UpdateMemoryInput,
 } from "../base.js";
 import type { EmbeddingClient } from "../embedding.js";
+import { createMemoryVectorRecord } from "../memory-vector-record.js";
 import { memoryItemSchema } from "../schemas.js";
 import type { MemoryItem, MemoryType } from "../schemas.js";
 import type { DocumentStore } from "../storage/document-store.js";
-import type {
-  VectorHit,
-  VectorStore,
-} from "../storage/vector-store.js";
+import type { VectorHit, VectorStore } from "../storage/vector-store.js";
 
 export abstract class StoredMemory extends BaseMemory {
   public abstract readonly type: MemoryType;
@@ -37,20 +35,7 @@ export abstract class StoredMemory extends BaseMemory {
 
     try {
       const vector = await this.embeddings.embed(parsed.content);
-
-      await this.vectors.upsert([
-        {
-          id: parsed.id,
-          vector,
-          metadata: {
-            memoryId: parsed.id,
-            userId: parsed.userId,
-            memoryType: parsed.memoryType,
-            importance: parsed.importance,
-            ...parsed.metadata,
-          },
-        },
-      ]);
+      await this.vectors.upsert([createMemoryVectorRecord(parsed, vector)]);
     } catch (error: unknown) {
       // 文档写入成功但向量写入失败时，回滚文档，避免半条记忆。
       await this.documents.delete(parsed.id);
@@ -116,34 +101,14 @@ export abstract class StoredMemory extends BaseMemory {
     try {
       const vector = await this.embeddings.embed(updated.content);
       await this.vectors.upsert([
-        {
-          id: updated.id,
-          vector,
-          metadata: {
-            memoryId: updated.id,
-            userId: updated.userId,
-            memoryType: updated.memoryType,
-            importance: updated.importance,
-            ...updated.metadata,
-          },
-        },
+        createMemoryVectorRecord(updated, vector),
       ]);
     } catch (error: unknown) {
       // 恢复文档和旧向量。
       await this.documents.update(current);
       const oldVector = await this.embeddings.embed(current.content);
       await this.vectors.upsert([
-        {
-          id: current.id,
-          vector: oldVector,
-          metadata: {
-            memoryId: current.id,
-            userId: current.userId,
-            memoryType: current.memoryType,
-            importance: current.importance,
-            ...current.metadata,
-          },
-        },
+        createMemoryVectorRecord(current, oldVector),
       ]);
       throw error;
     }

@@ -2479,6 +2479,7 @@ Neo4j 浏览器地址为 `http://localhost:7474`。
 ~~~dotenv
 # 第二阶段记忆系统
 MEMORY_SQLITE_PATH=.data/memory.sqlite
+MEMORY_OUTBOX_MAX_ATTEMPTS=5
 
 # 通用 Embedding 配置
 # 当前示例使用 SiliconFlow；以后可替换为其他兼容厂商。
@@ -2525,6 +2526,7 @@ const optionalNonEmptyString = z.preprocess(
 
 const productionMemoryEnvSchema = z.object({
   MEMORY_SQLITE_PATH: z.string().trim().min(1),
+  MEMORY_OUTBOX_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),
 
   EMBEDDING_API_KEY: z.string().trim().min(1),
   EMBEDDING_BASE_URL: z
@@ -4182,28 +4184,2924 @@ describe("StoredMemory consistency", () => {
 
 #### 24.3 删除一致性测试
 
-对语义记忆做真实集成测试：
+这个测试验证 `SemanticMemory.remove()` 的成功路径是否真的清除了三个后端。
+不要通过 `semanticMemory.retrieve()` 判断是否删除成功，因为检索为空只能说明
+“没有检索到”，不能证明 SQLite 行、Qdrant point 和 Neo4j relation 已经物理删除。
+
+测试采用以下组合：
 
 ~~~text
-1. 添加 semantic memory。
-2. 在 SQLite 中确认文档存在。
-3. 在 Qdrant 中按 memoryId 确认 point 存在。
-4. 在 Neo4j 中按 memoryId 确认关系存在。
-5. 调用 semanticMemory.remove(memoryId)。
-6. 再次确认三个后端都不存在该 memoryId。
+SQLite：真实 better-sqlite3，使用 :memory: 数据库
+Qdrant：真实本地 Qdrant 服务
+Neo4j：真实本地 Neo4j 服务
+Embedding：HashEmbeddingClient，不调用外部 API
 ~~~
 
-这里要注意当前删除顺序：
+这里使用 `HashEmbeddingClient` 是刻意的：本测试的目标是验证跨存储删除，
+不是验证 SiliconFlow 或其他 Embedding 服务。这样测试更快、无费用，也不会因为
+外部模型服务波动而失败。
+
+##### 24.3.1 启动外部服务
+
+先启动 Qdrant 和 Neo4j：
+
+~~~bash
+docker compose -f docker-compose.memory.yml up -d
+docker compose -f docker-compose.memory.yml ps
+~~~
+
+确认 Qdrant 可访问：
+
+~~~bash
+curl http://127.0.0.1:6333/collections
+~~~
+
+测试读取以下环境变量：
+
+~~~dotenv
+QDRANT_URL=http://127.0.0.1:6333
+QDRANT_API_KEY=
+
+NEO4J_URI=bolt://127.0.0.1:7687
+NEO4J_USERNAME=neo4j
+NEO4J_PASSWORD=change-me-in-local-env
+NEO4J_DATABASE=neo4j
+~~~
+
+这个测试不需要 `EMBEDDING_API_KEY`。
+
+##### 24.3.2 创建测试文件
+
+创建 `tests/semantic-delete-consistency.integration.test.ts`：
+
+~~~ts
+import "dotenv/config";
+import { randomUUID } from "node:crypto";
+import { QdrantClient } from "@qdrant/js-client-rest";
+import Database from "better-sqlite3";
+import neo4j, { type Driver } from "neo4j-driver";
+import { describe, expect, it } from "vitest";
+import { HashEmbeddingClient } from "../src/memory/embedding.js";
+import { RuleBasedKnowledgeExtractor } from "../src/memory/knowledge-extractor.js";
+import type { MemoryItem } from "../src/memory/schemas.js";
+import { Neo4jGraphStore } from "../src/memory/storage/neo4j-graph-store.js";
+import { QdrantVectorStore } from "../src/memory/storage/qdrant-vector-store.js";
+import { SqliteDocumentStore } from "../src/memory/storage/sqlite-document-store.js";
+import { SemanticMemory } from "../src/memory/types/semantic-memory.js";
+
+/*
+ * 普通 npm test 不应该依赖本地数据库服务。
+ * 只有显式设置 RUN_MEMORY_INTEGRATION_TESTS=true 时才执行。
+ */
+const describeIntegration =
+  process.env.RUN_MEMORY_INTEGRATION_TESTS === "true"
+    ? describe
+    : describe.skip;
+
+async function countGraphRelations(
+  driver: Driver,
+  database: string,
+  memoryId: string,
+): Promise<number> {
+  const result = await driver.executeQuery(
+    [
+      "MATCH ()-[edge:MEMORY_RELATION {memoryId: $memoryId}]->()",
+      "RETURN count(edge) AS count",
+    ].join("\n"),
+    { memoryId },
+    { database },
+  );
+
+  const value = result.records[0]?.get("count");
+
+  if (neo4j.isInt(value)) {
+    return value.toNumber();
+  }
+
+  return Number(value ?? 0);
+}
+
+describeIntegration(
+  "SemanticMemory delete consistency integration",
+  () => {
+    it("删除语义记忆后 SQLite、Qdrant 和 Neo4j 都不存在目标 ID", async () => {
+      /*
+       * 每次测试使用独立 userId 和 collection，
+       * 避免污染开发数据，也避免并发测试互相干扰。
+       */
+      const userId = `test-user-${randomUUID()}`;
+      const memoryId = randomUUID();
+      const collectionName =
+        `test_semantic_delete_${randomUUID().replaceAll("-", "_")}`;
+      const dimension = 64;
+      const neo4jDatabase =
+        process.env.NEO4J_DATABASE ?? "neo4j";
+
+      /*
+       * SQLite 使用真实数据库引擎，但数据库只存在于本测试进程内。
+       * 测试结束关闭连接后自动消失。
+       */
+      const sqlite = new Database(":memory:");
+      const documents = new SqliteDocumentStore(sqlite);
+
+      const qdrant = new QdrantClient({
+        url:
+          process.env.QDRANT_URL ??
+          "http://127.0.0.1:6333",
+        ...(process.env.QDRANT_API_KEY
+          ? { apiKey: process.env.QDRANT_API_KEY }
+          : {}),
+      });
+      const vectors = new QdrantVectorStore({
+        client: qdrant,
+        collectionName,
+        dimension,
+      });
+
+      const driver = neo4j.driver(
+        process.env.NEO4J_URI ??
+          "bolt://127.0.0.1:7687",
+        neo4j.auth.basic(
+          process.env.NEO4J_USERNAME ?? "neo4j",
+          process.env.NEO4J_PASSWORD ??
+            "change-me-in-local-env",
+        ),
+      );
+      const graph = new Neo4jGraphStore({
+        driver,
+        database: neo4jDatabase,
+      });
+
+      const memory = new SemanticMemory(
+        documents,
+        vectors,
+        new HashEmbeddingClient(dimension),
+        graph,
+        new RuleBasedKnowledgeExtractor(),
+      );
+
+      /*
+       * 这段内容必须能被 RuleBasedKnowledgeExtractor
+       * 提取出实体和关系。
+       *
+       * “用户喜欢TypeScript”会生成 LIKES 关系；
+       * 如果只写一个没有关系的普通句子，Neo4j 中可能只有实体，
+       * 无法完成 relation 的删除断言。
+       */
+      const item: MemoryItem = {
+        id: memoryId,
+        content: "用户喜欢TypeScript",
+        memoryType: "semantic",
+        userId,
+        timestamp: "2026-08-20T10:00:00.000Z",
+        importance: 0.9,
+        metadata: {
+          source: "semantic-delete-consistency-test",
+        },
+      };
+
+      try {
+        /*
+         * 构造函数不能 await，所以在真正写数据前，
+         * 显式等待 Qdrant collection、payload index
+         * 和 Neo4j constraint 初始化完成。
+         */
+        await vectors.initialize();
+        await driver.verifyConnectivity();
+        await graph.initialize();
+
+        // 第一步：通过 SemanticMemory 写入三个后端。
+        await memory.add(item);
+
+        /*
+         * 第二步：直接检查 SQLite。
+         * SemanticMemory.add() 会补充 entityIds 元数据，
+         * 所以这里使用 toMatchObject，而不是与原 item 完全相等。
+         */
+        const storedDocument = await documents.get(memoryId);
+
+        expect(storedDocument).toMatchObject({
+          id: memoryId,
+          userId,
+          memoryType: "semantic",
+          content: "用户喜欢TypeScript",
+        });
+        expect(storedDocument?.metadata.entityIds).toEqual(
+          expect.any(Array),
+        );
+
+        // 第三步：绕过 VectorStore 搜索，按 ID 直接检查 Qdrant point。
+        const pointsBeforeDelete = await qdrant.retrieve(
+          collectionName,
+          {
+            ids: [memoryId],
+            with_payload: true,
+            with_vector: false,
+          },
+        );
+
+        expect(pointsBeforeDelete).toHaveLength(1);
+        expect(pointsBeforeDelete[0]?.id).toBe(memoryId);
+        expect(pointsBeforeDelete[0]?.payload).toMatchObject({
+          memoryId,
+          userId,
+          memoryType: "semantic",
+        });
+
+        // 第四步：通过 Cypher 按 memoryId 直接检查 Neo4j 关系。
+        const graphRelationsBeforeDelete =
+          await countGraphRelations(
+            driver,
+            neo4jDatabase,
+            memoryId,
+          );
+
+        expect(graphRelationsBeforeDelete).toBeGreaterThan(0);
+
+        // 第五步：只调用领域对象的 remove，不直接删除三个后端。
+        const removed = await memory.remove(memoryId);
+
+        expect(removed).toBe(true);
+
+        // 第六步：再次直接检查 SQLite。
+        expect(await documents.get(memoryId)).toBeUndefined();
+        expect(await memory.has(memoryId)).toBe(false);
+
+        // 第七步：再次按 ID 检查 Qdrant。
+        const pointsAfterDelete = await qdrant.retrieve(
+          collectionName,
+          {
+            ids: [memoryId],
+            with_payload: true,
+            with_vector: false,
+          },
+        );
+
+        expect(pointsAfterDelete).toEqual([]);
+
+        // 第八步：再次检查 Neo4j。
+        const graphRelationsAfterDelete =
+          await countGraphRelations(
+            driver,
+            neo4jDatabase,
+            memoryId,
+          );
+
+        expect(graphRelationsAfterDelete).toBe(0);
+      } finally {
+        /*
+         * 即使中间断言失败，也尽量清理本测试创建的数据。
+         * allSettled 防止一个清理失败阻止其他资源释放。
+         */
+        await Promise.allSettled([
+          graph.clear(userId),
+          qdrant.deleteCollection(collectionName),
+        ]);
+
+        await driver.close();
+        sqlite.close();
+      }
+    }, 60_000);
+  },
+);
+~~~
+
+##### 24.3.3 理解测试中的三个“直接检查”
+
+SQLite 直接检查：
+
+~~~ts
+await documents.get(memoryId);
+~~~
+
+这里验证 `memories` 表中是否还有该主键。
+
+Qdrant 直接检查：
+
+~~~ts
+await qdrant.retrieve(collectionName, {
+  ids: [memoryId],
+  with_payload: true,
+  with_vector: false,
+});
+~~~
+
+不要使用相似度搜索验证删除，因为搜索结果会受到 query、score、limit 和 filter
+影响。按 point ID 查询才能证明目标 point 是否存在。
+
+Neo4j 直接检查：
+
+~~~cypher
+MATCH ()-[edge:MEMORY_RELATION {memoryId: $memoryId}]->()
+RETURN count(edge) AS count
+~~~
+
+这里检查的是保存该语义记忆的关系数量。删除前必须大于 0，删除后必须等于 0。
+
+##### 24.3.4 运行单个测试
+
+macOS/Linux：
+
+~~~bash
+RUN_MEMORY_INTEGRATION_TESTS=true npx vitest run tests/semantic-delete-consistency.integration.test.ts
+~~~
+
+也可以运行全部数据库集成测试：
+
+~~~bash
+npm run test:memory:integration
+~~~
+
+普通测试仍然不会连接 Qdrant 和 Neo4j：
+
+~~~bash
+npm test
+~~~
+
+因为没有设置 `RUN_MEMORY_INTEGRATION_TESTS=true`，该测试会显示为 skipped。
+
+##### 24.3.5 正确理解这个测试覆盖了什么
+
+当前 `SemanticMemory.remove()` 的成功路径是：
 
 ~~~text
 Qdrant delete → SQLite delete → Neo4j delete
 ~~~
 
-如果中途失败，应该记录错误并让一致性扫描重试。不要在删除失败后返回成功。
+这个集成测试证明：三个操作都成功时，三个后端最终都不存在目标
+`memoryId`。
+
+它还没有证明中途失败时能够自动恢复。例如：
+
+~~~text
+Qdrant 删除成功
+→ SQLite 删除成功
+→ Neo4j 删除失败
+~~~
+
+这种情况下 `SemanticMemory.remove()` 会抛出异常，而不是返回成功；但是已经完成的
+Qdrant 和 SQLite 删除不能自动回滚。后续一致性扫描器需要根据 SQLite 权威数据和
+删除任务记录，重试 Neo4j 清理。不要把这个成功路径测试误认为分布式事务测试。
 
 #### 24.4 后续增加一致性扫描器
 
-第一轮升级完成后，再增加一个独立维护任务：
+这一节不要放进 `SemanticMemory`。`SemanticMemory` 负责在线读写；一致性扫描器是一个
+低频运行的维护任务，负责比较三个后端的物理状态并修复漂移。
+
+第一版按下面的边界实现：
+
+~~~text
+SQLite：权威来源（source of truth）
+Qdrant：可由 SQLite 文档重新生成的派生数据
+Neo4j：可清理的语义关系索引
+~~~
+
+这里有一个容易误解的地方：当前报告只检查“孤立图关系”，不检查“缺失图关系”。
+一条 semantic memory 不一定能抽取出实体和关系，因此不能仅凭 SQLite 中有文档就断言
+Neo4j 中一定应该有关系。若以后要修复缺失图关系，需要额外保存“抽取是否成功、抽取版本、
+期望关系数量”等状态，不能在这一版中猜测。
+
+##### 24.4.1 实现前的验收条件
+
+开始本节前，先确保下面的测试分别通过：
+
+~~~bash
+npm run typecheck
+npm test
+docker compose -f docker-compose.memory.yml up -d
+npm run test:memory:integration
+~~~
+
+第一版扫描器还没有快照或分布式锁。运行扫描时不要同时执行记忆写入、更新和删除，推荐在
+开发环境或维护窗口中运行。否则扫描器可能把一个尚未完成的正常写入误认为短暂不一致。
+
+##### 24.4.2 新增维护接口
+
+现有 `VectorStore` 只支持检索，没有枚举所有 point ID 的能力；现有 `GraphStore` 也没有
+枚举所有关系 `memoryId` 的能力。不要为了维护任务扩大在线存储接口，新增
+`src/memory/consistency/consistency-store.ts`：
+
+~~~ts
+import type { VectorRecord } from "../storage/vector-store.js";
+
+/**
+ * 扫描器只依赖它真正需要的 Qdrant 能力。
+ * 这样 VectorStore 的在线检索接口不需要知道维护任务。
+ */
+export interface ConsistencyVectorStore {
+  listMemoryIds(userId?: string): Promise<string[]>;
+  upsert(records: VectorRecord[]): Promise<void>;
+  delete(ids: string[]): Promise<void>;
+}
+
+/** Neo4j 维护任务需要的最小接口。 */
+export interface ConsistencyGraphStore {
+  listMemoryIds(userId?: string): Promise<string[]>;
+  deleteByMemoryId(memoryId: string): Promise<void>;
+}
+~~~
+
+这里使用 TypeScript 的结构化类型：`QdrantVectorStore` 只要拥有这些方法，就可以传给
+扫描器，不必显式写 `implements ConsistencyVectorStore`。测试替身也只需实现三个或两个
+方法。
+
+##### 24.4.3 给 Qdrant 适配器增加分页枚举
+
+在 `src/memory/storage/qdrant-vector-store.ts` 的 `QdrantVectorStore` 类中增加下面的方法：
+
+~~~ts
+public async listMemoryIds(userId?: string): Promise<string[]> {
+  await this.ready;
+
+  const ids = new Set<string>();
+  let offset: string | number | undefined;
+
+  do {
+    const page = await this.options.client.scroll(
+      this.options.collectionName,
+      {
+        limit: 256,
+        ...(offset === undefined ? {} : { offset }),
+        ...(userId
+          ? {
+              filter: {
+                must: [
+                  {
+                    key: "userId",
+                    match: { value: userId },
+                  },
+                ],
+              },
+            }
+          : {}),
+        with_payload: true,
+        with_vector: false,
+      },
+    );
+
+    for (const point of page.points) {
+      const memoryId = point.payload?.memoryId;
+
+      if (typeof memoryId !== "string" || memoryId.length === 0) {
+        throw new Error(
+          `Qdrant point 缺少合法 memoryId：${String(point.id)}`,
+        );
+      }
+
+      /*
+       * 当前项目约定 Qdrant point.id 与 payload.memoryId 都等于记忆 ID。
+       * 不满足约定的 point 不能安全地交给 delete([memoryId]) 修复。
+       */
+      if (String(point.id) !== memoryId) {
+        throw new Error(
+          `Qdrant point ID 与 memoryId 不一致：${String(point.id)} != ${memoryId}`,
+        );
+      }
+
+      ids.add(memoryId);
+    }
+
+    const nextOffset = page.next_page_offset;
+    offset =
+      typeof nextOffset === "string" || typeof nextOffset === "number"
+        ? nextOffset
+        : undefined;
+  } while (offset !== undefined);
+
+  return [...ids].sort();
+}
+~~~
+
+关键点：
+
+1. 必须使用 `scroll()` 分页，不能用一次向量搜索代替全量扫描。
+2. `with_vector: false` 可以避免把 1024/1536 维向量通过网络全部传回来。
+3. 必须读取 payload 中的 `memoryId`。当前 collection 是记忆专用 collection，发现没有
+   `memoryId` 的 point 说明数据违反约定，应让扫描失败并人工确认，不能悄悄跳过。
+4. 代码假设这个 collection 专用于当前记忆系统，并坚持 `point.id === memoryId`。
+5. `userId` 存在时使用 Qdrant payload filter，便于按租户分批扫描。
+
+##### 24.4.4 给 Neo4j 适配器增加关系 ID 枚举
+
+在 `src/memory/storage/neo4j-graph-store.ts` 的 `Neo4jGraphStore` 类中增加：
+
+~~~ts
+public async listMemoryIds(userId?: string): Promise<string[]> {
+  await this.ready;
+
+  const result = await this.options.driver.executeQuery(
+    [
+      "MATCH ()-[edge:MEMORY_RELATION]->()",
+      "WHERE $userId IS NULL OR edge.userId = $userId",
+      "RETURN DISTINCT edge.memoryId AS memoryId",
+      "ORDER BY memoryId",
+    ].join("\n"),
+    { userId: userId ?? null },
+    { database: this.options.database },
+  );
+
+  return result.records
+    .map((record) => record.get("memoryId"))
+    .filter(
+      (memoryId): memoryId is string =>
+        typeof memoryId === "string" && memoryId.length > 0,
+    );
+}
+~~~
+
+这里必须使用 `DISTINCT`。一条语义记忆可能生成多条关系，报告关心的是出现不一致的
+记忆 ID，而不是关系数量。
+
+##### 24.4.5 统一生成 VectorRecord
+
+补向量时必须生成与正常写入完全相同的 payload。为了避免在线写入和扫描修复各复制一份
+映射逻辑，新建 `src/memory/memory-vector-record.ts`：
+
+~~~ts
+import type { MemoryItem } from "./schemas.js";
+import type { VectorRecord } from "./storage/vector-store.js";
+
+export function createMemoryVectorRecord(
+  item: MemoryItem,
+  vector: number[],
+): VectorRecord {
+  return {
+    id: item.id,
+    vector,
+    metadata: {
+      ...item.metadata,
+      memoryId: item.id,
+      userId: item.userId,
+      memoryType: item.memoryType,
+      importance: item.importance,
+    },
+  };
+}
+~~~
+
+这里把 `item.metadata` 放在前面，把系统保留字段放在后面。这样调用者即使在 metadata
+里传入同名键，也不能覆盖 `memoryId`、`userId`、`memoryType` 和 `importance`。
+
+然后修改 `src/memory/types/stored-memory.ts`：
+
+~~~ts
+import { createMemoryVectorRecord } from "../memory-vector-record.js";
+~~~
+
+把 `storeItem()` 中的 `upsert` 参数替换为：
+
+~~~ts
+await this.vectors.upsert([
+  createMemoryVectorRecord(parsed, vector),
+]);
+~~~
+
+把 `update()` 中写入新向量的参数替换为：
+
+~~~ts
+await this.vectors.upsert([
+  createMemoryVectorRecord(updated, vector),
+]);
+~~~
+
+把 `update()` 回滚旧向量时的参数替换为：
+
+~~~ts
+await this.vectors.upsert([
+  createMemoryVectorRecord(current, oldVector),
+]);
+~~~
+
+这三个位置都要替换。完成后先运行：
+
+~~~bash
+npm run typecheck
+npm test
+~~~
+
+##### 24.4.6 定义报告、修复结果和错误
+
+新建 `src/memory/consistency/memory-consistency-types.ts`：
+
+~~~ts
+export interface MemoryConsistencyReport {
+  /** SQLite 有文档，Qdrant 没有对应 point。 */
+  missingVectorIds: string[];
+
+  /** Qdrant 有 point，SQLite 没有对应文档。 */
+  orphanVectorIds: string[];
+
+  /** Neo4j 有关系，SQLite 没有对应文档。 */
+  orphanGraphMemoryIds: string[];
+}
+
+export interface MemoryConsistencyRepairFailure {
+  memoryId: string;
+  operation: "UPSERT_VECTOR" | "DELETE_VECTOR" | "DELETE_GRAPH";
+  message: string;
+}
+
+export interface MemoryConsistencyRepairResult {
+  before: MemoryConsistencyReport;
+  repairedVectorIds: string[];
+  deletedVectorIds: string[];
+  deletedGraphMemoryIds: string[];
+  failures: MemoryConsistencyRepairFailure[];
+  after: MemoryConsistencyReport;
+}
+
+function countInconsistencies(report: MemoryConsistencyReport): number {
+  return (
+    report.missingVectorIds.length +
+    report.orphanVectorIds.length +
+    report.orphanGraphMemoryIds.length
+  );
+}
+
+export class MemoryConsistencyRepairError extends Error {
+  public constructor(
+    public readonly result: MemoryConsistencyRepairResult,
+  ) {
+    super(
+      [
+        "记忆一致性修复未完全成功：",
+        `${result.failures.length} 个操作失败，`,
+        `${countInconsistencies(result.after)} 个不一致仍然存在`,
+      ].join(""),
+    );
+    this.name = "MemoryConsistencyRepairError";
+  }
+}
+~~~
+
+`scan()` 只返回发现的问题；`repair()` 返回做过哪些动作。错误对象携带完整结果，是为了
+满足“中途失败不能返回成功”：调用者既能收到失败，也能记录哪些操作已经完成。
+
+##### 24.4.7 实现基础扫描器
+
+新建 `src/memory/consistency/memory-consistency-scanner.ts`：
+
+~~~ts
+import type { EmbeddingClient } from "../embedding.js";
+import { createMemoryVectorRecord } from "../memory-vector-record.js";
+import type { DocumentStore } from "../storage/document-store.js";
+import type {
+  ConsistencyGraphStore,
+  ConsistencyVectorStore,
+} from "./consistency-store.js";
+import {
+  MemoryConsistencyRepairError,
+  type MemoryConsistencyRepairFailure,
+  type MemoryConsistencyRepairResult,
+  type MemoryConsistencyReport,
+} from "./memory-consistency-types.js";
+
+export interface MemoryConsistencyScanOptions {
+  /** 不传表示扫描全部用户；生产环境推荐每次只扫描一个用户。 */
+  userId?: string;
+}
+
+function difference(left: Set<string>, right: Set<string>): string[] {
+  return [...left].filter((id) => !right.has(id)).sort();
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+export class MemoryConsistencyScanner {
+  public constructor(
+    private readonly documents: DocumentStore,
+    private readonly vectors: ConsistencyVectorStore,
+    private readonly graph: ConsistencyGraphStore,
+    private readonly embeddings: EmbeddingClient,
+  ) {}
+
+  /**
+   * 只读操作：取得三个后端的 ID 快照并计算集合差集。
+   */
+  public async scan(
+    options: MemoryConsistencyScanOptions = {},
+  ): Promise<MemoryConsistencyReport> {
+    const [documents, vectorIds, graphMemoryIds] = await Promise.all([
+      this.documents.list(
+        options.userId ? { userId: options.userId } : {},
+      ),
+      this.vectors.listMemoryIds(options.userId),
+      this.graph.listMemoryIds(options.userId),
+    ]);
+
+    const documentIds = new Set(documents.map((item) => item.id));
+    const vectorIdSet = new Set(vectorIds);
+    const graphMemoryIdSet = new Set(graphMemoryIds);
+
+    return {
+      missingVectorIds: difference(documentIds, vectorIdSet),
+      orphanVectorIds: difference(vectorIdSet, documentIds),
+      orphanGraphMemoryIds: difference(graphMemoryIdSet, documentIds),
+    };
+  }
+
+  /**
+   * 基础版直接修复。每个 ID 独立处理，一个失败不会阻止其他 ID 被尝试。
+   * 所有操作结束后会重新扫描；只要出现异常，就抛出 RepairError。
+   */
+  public async scanAndRepair(
+    options: MemoryConsistencyScanOptions = {},
+  ): Promise<MemoryConsistencyRepairResult> {
+    const before = await this.scan(options);
+    const repairedVectorIds: string[] = [];
+    const deletedVectorIds: string[] = [];
+    const deletedGraphMemoryIds: string[] = [];
+    const failures: MemoryConsistencyRepairFailure[] = [];
+
+    for (const memoryId of before.missingVectorIds) {
+      try {
+        /* 文档可能在 scan() 后被删除，所以修复前必须重新读取。 */
+        const item = await this.documents.get(memoryId);
+        if (!item) continue;
+
+        const vector = await this.embeddings.embed(item.content);
+        await this.vectors.upsert([
+          createMemoryVectorRecord(item, vector),
+        ]);
+        repairedVectorIds.push(memoryId);
+      } catch (error: unknown) {
+        failures.push({
+          memoryId,
+          operation: "UPSERT_VECTOR",
+          message: errorMessage(error),
+        });
+      }
+    }
+
+    for (const memoryId of before.orphanVectorIds) {
+      try {
+        /* scan() 后若同 ID 文档已创建，就不能再把它的向量删掉。 */
+        if (await this.documents.get(memoryId)) continue;
+
+        /* delete 必须是幂等操作；point 已不存在也应该视为成功。 */
+        await this.vectors.delete([memoryId]);
+        deletedVectorIds.push(memoryId);
+      } catch (error: unknown) {
+        failures.push({
+          memoryId,
+          operation: "DELETE_VECTOR",
+          message: errorMessage(error),
+        });
+      }
+    }
+
+    for (const memoryId of before.orphanGraphMemoryIds) {
+      try {
+        /* 重新检查 SQLite 权威状态，避免删除刚刚恢复为有效的关系。 */
+        if (await this.documents.get(memoryId)) continue;
+
+        await this.graph.deleteByMemoryId(memoryId);
+        deletedGraphMemoryIds.push(memoryId);
+      } catch (error: unknown) {
+        failures.push({
+          memoryId,
+          operation: "DELETE_GRAPH",
+          message: errorMessage(error),
+        });
+      }
+    }
+
+    const after = await this.scan(options);
+    const result: MemoryConsistencyRepairResult = {
+      before,
+      repairedVectorIds,
+      deletedVectorIds,
+      deletedGraphMemoryIds,
+      failures,
+      after,
+    };
+
+    const hasRemainingInconsistency =
+      after.missingVectorIds.length > 0 ||
+      after.orphanVectorIds.length > 0 ||
+      after.orphanGraphMemoryIds.length > 0;
+
+    if (failures.length > 0 || hasRemainingInconsistency) {
+      throw new MemoryConsistencyRepairError(result);
+    }
+
+    return result;
+  }
+}
+~~~
+
+算法本质是三个集合的差集：
+
+~~~text
+missingVectorIds      = SQLite IDs - Qdrant IDs
+orphanVectorIds       = Qdrant IDs - SQLite IDs
+orphanGraphMemoryIds  = Neo4j memoryIds - SQLite IDs
+~~~
+
+`Promise.all()` 只并行读取三个快照；修复阶段按 ID 顺序执行，便于观察错误和限制外部服务
+压力。数据量大以后再增加 batch size 和并发上限，不要直接使用无限并发的
+`Promise.all(ids.map(...))`。
+
+##### 24.4.8 导出维护模块
+
+在 `src/memory/index.ts` 最后增加：
+
+~~~ts
+export {
+  MemoryConsistencyScanner,
+} from "./consistency/memory-consistency-scanner.js";
+export type {
+  MemoryConsistencyScanOptions,
+} from "./consistency/memory-consistency-scanner.js";
+export {
+  MemoryConsistencyRepairError,
+} from "./consistency/memory-consistency-types.js";
+export type {
+  MemoryConsistencyRepairFailure,
+  MemoryConsistencyRepairResult,
+  MemoryConsistencyReport,
+} from "./consistency/memory-consistency-types.js";
+~~~
+
+`ConsistencyVectorStore` 和 `ConsistencyGraphStore` 是内部维护端口，通常不需要从公共入口
+导出。
+
+##### 24.4.9 先写不依赖真实数据库的单元测试
+
+创建 `tests/memory-consistency-scanner.test.ts`：
+
+~~~ts
+import { describe, expect, it } from "vitest";
+import { HashEmbeddingClient } from "../src/memory/embedding.js";
+import { MemoryConsistencyScanner } from "../src/memory/consistency/memory-consistency-scanner.js";
+import { MemoryConsistencyRepairError } from "../src/memory/consistency/memory-consistency-types.js";
+import { InMemoryDocumentStore } from "../src/memory/storage/document-store.js";
+import type { VectorRecord } from "../src/memory/storage/vector-store.js";
+
+class FakeConsistencyVectorStore {
+  public readonly records = new Map<string, VectorRecord>();
+  public failDeleteId?: string;
+
+  public async listMemoryIds(): Promise<string[]> {
+    return [...this.records.keys()].sort();
+  }
+
+  public async upsert(records: VectorRecord[]): Promise<void> {
+    for (const record of records) {
+      this.records.set(record.id, structuredClone(record));
+    }
+  }
+
+  public async delete(ids: string[]): Promise<void> {
+    for (const id of ids) {
+      if (id === this.failDeleteId) {
+        throw new Error(`模拟 Qdrant 删除失败：${id}`);
+      }
+      this.records.delete(id);
+    }
+  }
+}
+
+class FakeConsistencyGraphStore {
+  public readonly memoryIds = new Set<string>();
+
+  public async listMemoryIds(): Promise<string[]> {
+    return [...this.memoryIds].sort();
+  }
+
+  public async deleteByMemoryId(memoryId: string): Promise<void> {
+    this.memoryIds.delete(memoryId);
+  }
+}
+
+describe("MemoryConsistencyScanner", () => {
+  it("发现三类不一致并直接修复", async () => {
+    const documents = new InMemoryDocumentStore();
+    const vectors = new FakeConsistencyVectorStore();
+    const graph = new FakeConsistencyGraphStore();
+    const embeddings = new HashEmbeddingClient(8);
+    const scanner = new MemoryConsistencyScanner(
+      documents,
+      vectors,
+      graph,
+      embeddings,
+    );
+
+    await documents.add({
+      id: "missing-vector",
+      content: "用户喜欢 TypeScript",
+      memoryType: "semantic",
+      userId: "user-1",
+      timestamp: "2026-08-20T10:00:00.000Z",
+      importance: 0.9,
+      metadata: { source: "test" },
+    });
+
+    await vectors.upsert([
+      {
+        id: "orphan-vector",
+        vector: new Array(8).fill(0),
+        metadata: {
+          memoryId: "orphan-vector",
+          userId: "user-1",
+          memoryType: "semantic",
+        },
+      },
+    ]);
+    graph.memoryIds.add("orphan-graph");
+
+    await expect(scanner.scan()).resolves.toEqual({
+      missingVectorIds: ["missing-vector"],
+      orphanVectorIds: ["orphan-vector"],
+      orphanGraphMemoryIds: ["orphan-graph"],
+    });
+
+    const result = await scanner.scanAndRepair();
+
+    expect(result.repairedVectorIds).toEqual(["missing-vector"]);
+    expect(result.deletedVectorIds).toEqual(["orphan-vector"]);
+    expect(result.deletedGraphMemoryIds).toEqual(["orphan-graph"]);
+    expect(result.failures).toEqual([]);
+    expect(result.after).toEqual({
+      missingVectorIds: [],
+      orphanVectorIds: [],
+      orphanGraphMemoryIds: [],
+    });
+
+    const repaired = vectors.records.get("missing-vector");
+    expect(repaired?.vector).toHaveLength(8);
+    expect(repaired?.metadata).toMatchObject({
+      memoryId: "missing-vector",
+      userId: "user-1",
+      memoryType: "semantic",
+      importance: 0.9,
+      source: "test",
+    });
+  });
+
+  it("修复失败时抛错且保留失败报告", async () => {
+    const documents = new InMemoryDocumentStore();
+    const vectors = new FakeConsistencyVectorStore();
+    const graph = new FakeConsistencyGraphStore();
+    const scanner = new MemoryConsistencyScanner(
+      documents,
+      vectors,
+      graph,
+      new HashEmbeddingClient(8),
+    );
+
+    await vectors.upsert([
+      {
+        id: "cannot-delete",
+        vector: new Array(8).fill(0),
+        metadata: { memoryId: "cannot-delete" },
+      },
+    ]);
+    vectors.failDeleteId = "cannot-delete";
+
+    try {
+      await scanner.scanAndRepair();
+      throw new Error("测试失败：scanAndRepair() 不应该返回成功");
+    } catch (error: unknown) {
+      expect(error).toBeInstanceOf(MemoryConsistencyRepairError);
+
+      const repairError = error as MemoryConsistencyRepairError;
+      expect(repairError.result.failures).toEqual([
+        {
+          memoryId: "cannot-delete",
+          operation: "DELETE_VECTOR",
+          message: "模拟 Qdrant 删除失败：cannot-delete",
+        },
+      ]);
+      expect(repairError.result.after.orphanVectorIds).toEqual([
+        "cannot-delete",
+      ]);
+    }
+  });
+});
+~~~
+
+运行：
+
+~~~bash
+npx vitest run tests/memory-consistency-scanner.test.ts
+npm run typecheck
+~~~
+
+第二个测试非常重要：它证明删除失败时方法会抛出异常，而不是打印一行日志后返回成功。
+
+##### 24.4.10 做一次真实漂移演练
+
+这一小节验证的不是测试替身，而是下面这条真实链路：
+
+~~~text
+真实 SQLite 引擎（:memory:）
+        +
+真实本地 Qdrant 服务
+        +
+真实本地 Neo4j 服务
+        ↓
+MemoryConsistencyScanner.scan()
+        ↓
+MemoryConsistencyScanner.scanAndRepair()
+        ↓
+直接读取三个后端确认物理结果
+~~~
+
+Embedding 仍使用 `HashEmbeddingClient`，因为本测试的目标是数据库一致性，不是验证外部
+Embedding 厂商。这样无需消耗 SiliconFlow/OpenAI-compatible API 配额，也不会因为网络
+波动导致一致性测试不稳定。
+
+###### 24.4.10.1 确认前置代码已经完成
+
+开始前确认已经完成 24.4.2～24.4.9，尤其是：
+
+~~~text
+[ ] QdrantVectorStore.listMemoryIds(userId?) 已实现
+[ ] Neo4jGraphStore.listMemoryIds(userId?) 已实现
+[ ] createMemoryVectorRecord() 已实现
+[ ] MemoryConsistencyScanner 已实现
+[ ] memory-consistency-scanner.test.ts 已通过
+~~~
+
+先执行：
+
+~~~bash
+npm run typecheck
+npx vitest run tests/memory-consistency-scanner.test.ts
+~~~
+
+如果这里还没有通过，不要先写集成测试，否则很难判断错误来自扫描算法还是外部服务。
+
+###### 24.4.10.2 启动 Qdrant 和 Neo4j
+
+在 `chapter7/agent-patterns-ts` 目录执行：
+
+~~~bash
+docker compose -f docker-compose.memory.yml up -d
+docker compose -f docker-compose.memory.yml ps
+~~~
+
+Qdrant 可以这样检查：
+
+~~~bash
+curl http://127.0.0.1:6333/collections
+~~~
+
+应返回 JSON，而不是连接失败。Neo4j 的 Bolt 默认地址是
+`bolt://127.0.0.1:7687`。测试会调用 `driver.verifyConnectivity()` 做最终检查。
+
+确保 `.env` 至少包含与 `docker-compose.memory.yml` 一致的连接信息：
+
+~~~dotenv
+QDRANT_URL=http://127.0.0.1:6333
+QDRANT_API_KEY=
+
+NEO4J_URI=bolt://127.0.0.1:7687
+NEO4J_USERNAME=neo4j
+NEO4J_PASSWORD=change-me-in-local-env
+NEO4J_DATABASE=neo4j
+~~~
+
+如果你的 compose 文件使用了不同密码，以 compose 中的值为准。本测试不需要
+`EMBEDDING_API_KEY`。
+
+###### 24.4.10.3 明确三种漂移如何制造
+
+不要通过 `SemanticMemory.add()` 注入这三条数据，因为领域对象会同时写多个后端，无法
+稳定制造不一致。测试必须绕过领域对象，直接操作适配器：
+
+~~~text
+缺失向量：
+SQLite        有 missingVectorId
+Qdrant        无 missingVectorId
+
+孤立向量：
+SQLite        无 orphanVectorId
+Qdrant        有 orphanVectorId
+
+孤立图关系：
+SQLite        无 orphanGraphId
+Neo4j         有 memoryId = orphanGraphId 的关系
+~~~
+
+这里使用三个不同的 UUID。不要让三种漂移共用一个 ID，否则集合差集会互相影响，测试
+无法精确证明每条修复分支都执行了。
+
+###### 24.4.10.4 创建完整集成测试文件
+
+创建 `tests/memory-consistency-scanner.integration.test.ts`，写入下面的完整代码：
+
+~~~ts
+import "dotenv/config";
+import { randomUUID } from "node:crypto";
+import { QdrantClient } from "@qdrant/js-client-rest";
+import Database from "better-sqlite3";
+import neo4j, { type Driver } from "neo4j-driver";
+import { describe, expect, it } from "vitest";
+import { MemoryConsistencyScanner } from "../src/memory/consistency/memory-consistency-scanner.js";
+import { HashEmbeddingClient } from "../src/memory/embedding.js";
+import { Neo4jGraphStore } from "../src/memory/storage/neo4j-graph-store.js";
+import { QdrantVectorStore } from "../src/memory/storage/qdrant-vector-store.js";
+import { SqliteDocumentStore } from "../src/memory/storage/sqlite-document-store.js";
+
+/*
+ * 普通 npm test 不连接外部数据库。
+ * 只有显式设置开关时才执行这组真实集成测试。
+ */
+const describeIntegration =
+  process.env.RUN_MEMORY_INTEGRATION_TESTS === "true"
+    ? describe
+    : describe.skip;
+
+/** 直接通过 Cypher 统计指定 memoryId 的真实关系数量。 */
+async function countGraphRelations(
+  driver: Driver,
+  database: string,
+  memoryId: string,
+): Promise<number> {
+  const result = await driver.executeQuery(
+    [
+      "MATCH ()-[edge:MEMORY_RELATION {memoryId: $memoryId}]->()",
+      "RETURN count(edge) AS count",
+    ].join("\n"),
+    { memoryId },
+    { database },
+  );
+
+  const value = result.records[0]?.get("count");
+
+  /* Neo4j count() 返回 Integer，需要显式转换成普通 number。 */
+  if (neo4j.isInt(value)) return value.toNumber();
+  return Number(value ?? 0);
+}
+
+/** 直接检查指定 Qdrant point 是否存在，不通过 VectorStore.search()。 */
+async function retrievePoint(
+  client: QdrantClient,
+  collectionName: string,
+  memoryId: string,
+) {
+  return client.retrieve(collectionName, {
+    ids: [memoryId],
+    with_payload: true,
+    with_vector: false,
+  });
+}
+
+describeIntegration("MemoryConsistencyScanner integration", () => {
+  it("发现并修复缺失向量、孤立向量和孤立图关系", async () => {
+    /*
+     * 每次执行都使用随机 userId、ID 和 collection。
+     * 这样不会污染开发数据，并行测试之间也不会互相干扰。
+     */
+    const userId = `consistency-user-${randomUUID()}`;
+    const missingVectorId = randomUUID();
+    const orphanVectorId = randomUUID();
+    const orphanGraphId = randomUUID();
+    const graphSourceId = randomUUID();
+    const graphTargetId = randomUUID();
+    const graphRelationId = randomUUID();
+    const collectionName =
+      `test_memory_consistency_${randomUUID().replaceAll("-", "_")}`;
+    const dimension = 64;
+    const neo4jDatabase = process.env.NEO4J_DATABASE ?? "neo4j";
+
+    /*
+     * 使用真实 better-sqlite3 引擎，但数据库只存在于当前进程内。
+     * sqlite.close() 后数据自动消失。
+     */
+    const sqlite = new Database(":memory:");
+    const documents = new SqliteDocumentStore(sqlite);
+
+    const qdrant = new QdrantClient({
+      url: process.env.QDRANT_URL ?? "http://127.0.0.1:6333",
+      ...(process.env.QDRANT_API_KEY
+        ? { apiKey: process.env.QDRANT_API_KEY }
+        : {}),
+    });
+    const vectors = new QdrantVectorStore({
+      client: qdrant,
+      collectionName,
+      dimension,
+    });
+
+    const driver = neo4j.driver(
+      process.env.NEO4J_URI ?? "bolt://127.0.0.1:7687",
+      neo4j.auth.basic(
+        process.env.NEO4J_USERNAME ?? "neo4j",
+        process.env.NEO4J_PASSWORD ?? "change-me-in-local-env",
+      ),
+    );
+    const graph = new Neo4jGraphStore({
+      driver,
+      database: neo4jDatabase,
+    });
+
+    const embeddings = new HashEmbeddingClient(dimension);
+    const scanner = new MemoryConsistencyScanner(
+      documents,
+      vectors,
+      graph,
+      embeddings,
+    );
+
+    try {
+      /*
+       * Qdrant/Neo4j 的构造函数会启动异步初始化，
+       * 注入测试数据之前要显式等待初始化完成。
+       */
+      await vectors.initialize();
+      await driver.verifyConnectivity();
+      await graph.initialize();
+
+      /*
+       * 第一步：只写 SQLite，制造“SQLite 有、Qdrant 无”。
+       * 不能调用 SemanticMemory.add()，否则它会同时写入 Qdrant。
+       */
+      await documents.add({
+        id: missingVectorId,
+        content: "用户喜欢 TypeScript",
+        memoryType: "semantic",
+        userId,
+        timestamp: "2026-08-20T10:00:00.000Z",
+        importance: 0.9,
+        metadata: {
+          source: "consistency-integration",
+        },
+      });
+
+      /*
+       * 第二步：只写 Qdrant，制造“Qdrant 有、SQLite 无”。
+       * point.id 和 payload.memoryId 必须遵守同 ID 约定。
+       */
+      await vectors.upsert([
+        {
+          id: orphanVectorId,
+          vector: await embeddings.embed("这是一条孤立向量"),
+          metadata: {
+            memoryId: orphanVectorId,
+            userId,
+            memoryType: "semantic",
+            importance: 0.5,
+            source: "consistency-integration",
+          },
+        },
+      ]);
+
+      /*
+       * 第三步：只写 Neo4j，制造“Neo4j 有关系、SQLite 无”。
+       * addRelation() 要求源实体和目标实体已经存在。
+       */
+      await graph.addEntity({
+        id: graphSourceId,
+        userId,
+        name: "用户",
+        type: "person",
+        properties: {},
+      });
+      await graph.addEntity({
+        id: graphTargetId,
+        userId,
+        name: "TypeScript",
+        type: "technology",
+        properties: {},
+      });
+      await graph.addRelation({
+        id: graphRelationId,
+        userId,
+        sourceId: graphSourceId,
+        targetId: graphTargetId,
+        type: "LIKES",
+        memoryId: orphanGraphId,
+        properties: {},
+      });
+
+      /*
+       * 第四步：修复前先直接检查三个后端，证明漂移确实制造成功。
+       */
+      expect(await documents.get(missingVectorId)).toMatchObject({
+        id: missingVectorId,
+        userId,
+        memoryType: "semantic",
+      });
+      expect(await documents.get(orphanVectorId)).toBeUndefined();
+      expect(await documents.get(orphanGraphId)).toBeUndefined();
+
+      expect(
+        await retrievePoint(qdrant, collectionName, missingVectorId),
+      ).toEqual([]);
+
+      const orphanVectorBefore = await retrievePoint(
+        qdrant,
+        collectionName,
+        orphanVectorId,
+      );
+      expect(orphanVectorBefore).toHaveLength(1);
+      expect(orphanVectorBefore[0]?.payload).toMatchObject({
+        memoryId: orphanVectorId,
+        userId,
+      });
+
+      expect(
+        await countGraphRelations(
+          driver,
+          neo4jDatabase,
+          orphanGraphId,
+        ),
+      ).toBe(1);
+
+      /*
+       * 第五步：只读扫描必须精确报告三种漂移，不能修改数据。
+       */
+      const reportBefore = await scanner.scan({ userId });
+
+      expect(reportBefore).toEqual({
+        missingVectorIds: [missingVectorId],
+        orphanVectorIds: [orphanVectorId],
+        orphanGraphMemoryIds: [orphanGraphId],
+      });
+
+      /* 再检查一次孤立数据，证明 scan() 本身没有执行修复。 */
+      expect(
+        await retrievePoint(qdrant, collectionName, orphanVectorId),
+      ).toHaveLength(1);
+      expect(
+        await countGraphRelations(
+          driver,
+          neo4jDatabase,
+          orphanGraphId,
+        ),
+      ).toBe(1);
+
+      /*
+       * 第六步：执行基础版直接修复。
+       */
+      const repair = await scanner.scanAndRepair({ userId });
+
+      expect(repair.before).toEqual(reportBefore);
+      expect(repair.repairedVectorIds).toEqual([missingVectorId]);
+      expect(repair.deletedVectorIds).toEqual([orphanVectorId]);
+      expect(repair.deletedGraphMemoryIds).toEqual([orphanGraphId]);
+      expect(repair.failures).toEqual([]);
+      expect(repair.after).toEqual({
+        missingVectorIds: [],
+        orphanVectorIds: [],
+        orphanGraphMemoryIds: [],
+      });
+
+      /*
+       * 第七步：再次独立 scan，避免只相信 scanAndRepair() 返回的 after。
+       */
+      await expect(scanner.scan({ userId })).resolves.toEqual({
+        missingVectorIds: [],
+        orphanVectorIds: [],
+        orphanGraphMemoryIds: [],
+      });
+
+      /*
+       * 第八步：直接检查 SQLite。
+       * 修复缺失向量不能删除或修改权威文档。
+       */
+      expect(await documents.get(missingVectorId)).toMatchObject({
+        id: missingVectorId,
+        content: "用户喜欢 TypeScript",
+        userId,
+        memoryType: "semantic",
+        importance: 0.9,
+        metadata: {
+          source: "consistency-integration",
+        },
+      });
+      expect(await documents.get(orphanVectorId)).toBeUndefined();
+      expect(await documents.get(orphanGraphId)).toBeUndefined();
+
+      /*
+       * 第九步：直接检查 Qdrant。
+       * missingVectorId 应被重新计算 Embedding 并 upsert；
+       * orphanVectorId 应被删除。
+       */
+      const repairedVector = await retrievePoint(
+        qdrant,
+        collectionName,
+        missingVectorId,
+      );
+
+      expect(repairedVector).toHaveLength(1);
+      expect(repairedVector[0]?.id).toBe(missingVectorId);
+      expect(repairedVector[0]?.payload).toMatchObject({
+        memoryId: missingVectorId,
+        userId,
+        memoryType: "semantic",
+        importance: 0.9,
+        source: "consistency-integration",
+      });
+
+      expect(
+        await retrievePoint(qdrant, collectionName, orphanVectorId),
+      ).toEqual([]);
+
+      /*
+       * 第十步：直接检查 Neo4j。
+       */
+      expect(
+        await countGraphRelations(
+          driver,
+          neo4jDatabase,
+          orphanGraphId,
+        ),
+      ).toBe(0);
+    } finally {
+      /*
+       * 任一断言失败也必须清理测试资源。
+       * allSettled 确保一个清理失败不会阻止另一个清理。
+       */
+      await Promise.allSettled([
+        graph.clear(userId),
+        qdrant.deleteCollection(collectionName),
+      ]);
+
+      await driver.close();
+      sqlite.close();
+    }
+  }, 60_000);
+});
+~~~
+
+###### 24.4.10.5 为什么要同时检查 report 和物理后端
+
+`repair.after` 为空只能证明扫描器认为修复完成。测试还必须绕过扫描器，直接读取后端：
+
+| 检查对象 | 直接检查方式 | 证明内容 |
+|---|---|---|
+| SQLite | `documents.get(id)` | 权威文档没有被误删或篡改 |
+| Qdrant | `qdrant.retrieve(collection, { ids })` | point 确实被补齐或物理删除 |
+| Neo4j | `MATCH ... {memoryId}` + `count(edge)` | 关系确实被物理删除 |
+
+不要用 `vectors.search()` 检查 point 是否存在。搜索受相似度、limit、filter 和排序影响，
+“没有搜索到”不等于 point 不存在。
+
+###### 24.4.10.6 为什么测试要按 userId 扫描
+
+测试调用：
+
+~~~ts
+scanner.scan({ userId });
+scanner.scanAndRepair({ userId });
+~~~
+
+这同时验证三个后端的租户过滤。随机 `userId` 可以隔离开发库中的其他记忆。如果测试误用
+全量 `scan()`，开发环境中已有的残留数据也可能进入报告，造成不稳定失败。
+
+Qdrant 的孤立 point payload 必须包含相同的 `userId`；Neo4j 的关系也必须包含该
+`userId`。否则按用户扫描不会看到它们。
+
+###### 24.4.10.7 运行测试
+
+只运行这一项：
+
+~~~bash
+RUN_MEMORY_INTEGRATION_TESTS=true npx vitest run tests/memory-consistency-scanner.integration.test.ts
+~~~
+
+运行全部记忆集成测试：
+
+~~~bash
+npm run test:memory:integration
+~~~
+
+普通测试不设置开关，因此该文件应显示 skipped：
+
+~~~bash
+npm test
+~~~
+
+###### 24.4.10.8 常见错误排查
+
+如果报告没有 `orphanVectorId`：
+
+~~~text
+检查 Qdrant payload 是否同时包含 memoryId 和测试 userId。
+检查 listMemoryIds(userId) 是否真的把 userId 转成 payload filter。
+~~~
+
+如果报告没有 `orphanGraphId`：
+
+~~~text
+检查关系类型是否为 MEMORY_RELATION。
+检查 edge.memoryId 和 edge.userId 是否已经写入。
+检查 Neo4j listMemoryIds() 是否使用 DISTINCT edge.memoryId。
+~~~
+
+如果 `missingVectorId` 修复后仍然缺失：
+
+~~~text
+检查 createMemoryVectorRecord() 是否让 id 等于 item.id。
+检查 HashEmbeddingClient 维度与 Qdrant collection 维度是否都为 64。
+检查 Qdrant upsert 是否设置 wait: true。
+~~~
+
+如果 Neo4j 连接失败：
+
+~~~text
+检查容器状态、NEO4J_URI、NEO4J_USERNAME 和 NEO4J_PASSWORD。
+特别注意 .env 密码必须与 docker-compose.memory.yml 一致。
+~~~
+
+如果测试结束后留下 collection 或图数据：
+
+~~~text
+确认清理代码放在 finally 中。
+确认使用随机 userId 和随机 collectionName。
+确认 driver.close() 和 sqlite.close() 一定执行。
+~~~
+
+###### 24.4.10.9 本小节完成标准
+
+下面全部满足后，才算完成真实漂移演练：
+
+~~~text
+[ ] 修复前直接物理检查确认三种漂移真实存在
+[ ] scan() 精确报告三个不同 ID
+[ ] scan() 后数据保持不变，证明扫描是只读操作
+[ ] scanAndRepair() 报告三个修复动作且 failures 为空
+[ ] 独立再次 scan() 返回三个空数组
+[ ] SQLite 权威文档仍然存在且内容不变
+[ ] Qdrant 缺失 point 已补齐，孤立 point 已删除
+[ ] Neo4j 孤立关系已删除
+[ ] finally 能清理随机 collection、随机用户图数据和数据库连接
+[ ] 单项集成测试以及完整集成测试均通过
+~~~
+
+至此，“扫描 + 直接修复”基础版完成。先不要实现定时器；先把扫描器做成一个可被脚本、
+cron 或队列消费者显式调用的服务。
+
+##### 24.4.11 严格审计模式：扫描器只写 outbox
+
+###### 24.4.11.1 先明确这一版 outbox 的边界
+
+如果要求每个一致性修复动作都可追踪，就不要让扫描进程直接修改 Qdrant/Neo4j。执行链
+改为：
+
+~~~text
+扫描器 scan()
+→ 把每个差异写入 SQLite memory_outbox
+→ 独立 worker 领取任务
+→ 执行 Embedding/upsert/delete
+→ 标记 COMPLETED 或 FAILED
+~~~
+
+这是一套“维护修复 outbox”，记录扫描器发现的修复任务。它还不是在线写入的事务 outbox。
+例如，`SemanticMemory.add()` 写 SQLite 后进程立即崩溃，扫描器下次运行才会发现缺失向量
+并入队。如果以后要求在线写入与 outbox 事件绝对原子，需要让“写 memories 表”和“写
+memory_outbox 表”处于同一个 SQLite 事务，那是下一阶段改造。
+
+严格模式下必须遵守：
+
+~~~text
+scan()                         只读三个后端
+enqueueConsistencyRepairs()   只写 SQLite outbox
+MemoryOutboxWorker            才能写 Qdrant/Neo4j
+scanAndRepair()                严格模式不调用
+~~~
+
+###### 24.4.11.2 设计状态机和幂等键
+
+状态变化如下：
+
+~~~text
+PENDING → PROCESSING → COMPLETED
+                 └──→ FAILED → 下一轮 worker 再次领取
+                               → 达到上限后 DEAD_LETTER
+~~~
+
+同一个 `memoryId + operation` 只能存在一个未解决任务。以下状态都视为未解决：
+
+~~~text
+PENDING、PROCESSING、FAILED、DEAD_LETTER
+~~~
+
+`COMPLETED` 不阻止以后创建新任务，因为同一种数据漂移可能在未来再次发生。
+`DEAD_LETTER` 会阻止自动创建新任务，必须由维护人员检查后显式重新入队。
+
+###### 24.4.11.3 创建 SqliteMemoryOutbox
+
+不要把 outbox 表迁移塞进 `SqliteDocumentStore`。outbox 是独立维护模块，应由自己的仓储
+负责建表。创建 `src/memory/consistency/sqlite-memory-outbox.ts`，完整代码如下：
+
+~~~ts
+import { randomUUID } from "node:crypto";
+import type Database from "better-sqlite3";
+
+const operations = [
+  "UPSERT_VECTOR",
+  "DELETE_VECTOR",
+  "DELETE_GRAPH",
+] as const;
+
+const statuses = [
+  "PENDING",
+  "PROCESSING",
+  "COMPLETED",
+  "FAILED",
+  "DEAD_LETTER",
+] as const;
+
+export type MemoryOutboxOperation = (typeof operations)[number];
+export type MemoryOutboxStatus = (typeof statuses)[number];
+
+export interface MemoryOutboxTask {
+  id: string;
+  memoryId: string;
+  operation: MemoryOutboxOperation;
+  payload: Record<string, unknown>;
+  status: MemoryOutboxStatus;
+  attempts: number;
+  createdAt: string;
+  lastError?: string;
+}
+
+interface OutboxRow {
+  id: string;
+  memory_id: string;
+  operation: string;
+  payload_json: string;
+  status: string;
+  attempts: number;
+  created_at: string;
+  last_error: string | null;
+}
+
+function includesValue<T extends string>(
+  values: readonly T[],
+  value: string,
+): value is T {
+  return values.includes(value as T);
+}
+
+function rowToTask(row: OutboxRow): MemoryOutboxTask {
+  if (!includesValue(operations, row.operation)) {
+    throw new Error(`Outbox ${row.id} 的 operation 不合法：${row.operation}`);
+  }
+  if (!includesValue(statuses, row.status)) {
+    throw new Error(`Outbox ${row.id} 的 status 不合法：${row.status}`);
+  }
+
+  let payload: unknown;
+  try {
+    payload = JSON.parse(row.payload_json);
+  } catch {
+    throw new Error(`Outbox ${row.id} 的 payload_json 不是合法 JSON`);
+  }
+
+  if (
+    typeof payload !== "object" ||
+    payload === null ||
+    Array.isArray(payload)
+  ) {
+    throw new Error(`Outbox ${row.id} 的 payload_json 必须是 JSON 对象`);
+  }
+
+  return {
+    id: row.id,
+    memoryId: row.memory_id,
+    operation: row.operation,
+    payload: payload as Record<string, unknown>,
+    status: row.status,
+    attempts: row.attempts,
+    createdAt: row.created_at,
+    ...(row.last_error ? { lastError: row.last_error } : {}),
+  };
+}
+
+export class SqliteMemoryOutbox {
+  public constructor(
+    private readonly database: Database.Database,
+    private readonly now: () => Date = () => new Date(),
+  ) {
+    this.migrate();
+  }
+
+  private migrate(): void {
+    this.database.exec(
+      [
+        "CREATE TABLE IF NOT EXISTS memory_outbox (",
+        "  id TEXT PRIMARY KEY,",
+        "  memory_id TEXT NOT NULL,",
+        "  operation TEXT NOT NULL CHECK (operation IN (",
+        "    'UPSERT_VECTOR', 'DELETE_VECTOR', 'DELETE_GRAPH'",
+        "  )),",
+        "  payload_json TEXT NOT NULL,",
+        "  status TEXT NOT NULL CHECK (status IN (",
+        "    'PENDING', 'PROCESSING', 'COMPLETED', 'FAILED', 'DEAD_LETTER'",
+        "  )),",
+        "  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),",
+        "  created_at TEXT NOT NULL,",
+        "  last_error TEXT",
+        ");",
+        "CREATE INDEX IF NOT EXISTS idx_memory_outbox_status_created",
+        "  ON memory_outbox(status, created_at);",
+        "CREATE INDEX IF NOT EXISTS idx_memory_outbox_memory_operation",
+        "  ON memory_outbox(memory_id, operation);",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_outbox_unresolved",
+        "  ON memory_outbox(memory_id, operation)",
+        "  WHERE status IN (",
+        "    'PENDING', 'PROCESSING', 'FAILED', 'DEAD_LETTER'",
+        "  );",
+      ].join("\n"),
+    );
+  }
+
+  /** 同一个未完成修复只保留一条任务，防止重复扫描不断堆积。 */
+  public enqueue(
+    memoryId: string,
+    operation: MemoryOutboxOperation,
+    payload: Record<string, unknown> = {},
+  ): string | undefined {
+    if (memoryId.trim().length === 0) {
+      throw new Error("Outbox memoryId 不能为空");
+    }
+
+    const id = randomUUID();
+    const result = this.database.prepare(
+      [
+        "INSERT INTO memory_outbox (",
+        "  id, memory_id, operation, payload_json, status, created_at",
+        ")",
+        "SELECT @id, @memoryId, @operation, @payloadJson, 'PENDING', @createdAt",
+        "WHERE NOT EXISTS (",
+        "  SELECT 1 FROM memory_outbox",
+        "  WHERE memory_id = @memoryId",
+        "    AND operation = @operation",
+        "    AND status IN (",
+        "      'PENDING', 'PROCESSING', 'FAILED', 'DEAD_LETTER'",
+        "    )",
+        ")",
+      ].join("\n"),
+    ).run({
+      id,
+      memoryId,
+      operation,
+      payloadJson: JSON.stringify(payload),
+      createdAt: this.now().toISOString(),
+    });
+
+    return result.changes > 0 ? id : undefined;
+  }
+
+  /**
+   * 当前教程限定单 worker。事务保证读取和改成 PROCESSING 同时完成。
+   */
+  public claimNext(maxAttempts: number): MemoryOutboxTask | undefined {
+    if (!Number.isInteger(maxAttempts) || maxAttempts <= 0) {
+      throw new Error("maxAttempts 必须是正整数");
+    }
+
+    const claim = this.database.transaction(() => {
+      const row = this.database.prepare(
+        [
+          "SELECT * FROM memory_outbox",
+          "WHERE status IN ('PENDING', 'FAILED')",
+          "  AND attempts < ?",
+          "ORDER BY created_at ASC",
+          "LIMIT 1",
+        ].join("\n"),
+      ).get(maxAttempts) as OutboxRow | undefined;
+
+      if (!row) return undefined;
+
+      this.database.prepare(
+        [
+          "UPDATE memory_outbox",
+          "SET status = 'PROCESSING', attempts = attempts + 1, last_error = NULL",
+          "WHERE id = ?",
+        ].join("\n"),
+      ).run(row.id);
+
+      return rowToTask({
+        ...row,
+        status: "PROCESSING",
+        attempts: row.attempts + 1,
+        last_error: null,
+      });
+    });
+
+    return claim();
+  }
+
+  public complete(id: string): void {
+    const result = this.database.prepare(
+      [
+        "UPDATE memory_outbox",
+        "SET status = 'COMPLETED', last_error = NULL",
+        "WHERE id = ? AND status = 'PROCESSING'",
+      ].join("\n"),
+    ).run(id);
+
+    if (result.changes !== 1) {
+      throw new Error(`Outbox 任务无法完成：${id}`);
+    }
+  }
+
+  public fail(id: string, message: string, deadLetter: boolean): void {
+    const result = this.database.prepare(
+      [
+        "UPDATE memory_outbox",
+        "SET status = ?, last_error = ?",
+        "WHERE id = ? AND status = 'PROCESSING'",
+      ].join("\n"),
+    ).run(deadLetter ? "DEAD_LETTER" : "FAILED", message, id);
+
+    if (result.changes !== 1) {
+      throw new Error(`Outbox 任务无法标记失败：${id}`);
+    }
+  }
+
+  /**
+   * 单 worker 进程重启时恢复中断任务。
+   * 已经耗尽尝试次数的任务直接进入死信，避免永远停留在 FAILED。
+   */
+  public recoverInterrupted(maxAttempts: number): void {
+    if (!Number.isInteger(maxAttempts) || maxAttempts <= 0) {
+      throw new Error("maxAttempts 必须是正整数");
+    }
+
+    this.database.prepare(
+      [
+        "UPDATE memory_outbox",
+        "SET status = CASE",
+        "      WHEN attempts >= @maxAttempts THEN 'DEAD_LETTER'",
+        "      ELSE 'FAILED'",
+        "    END,",
+        "    last_error = 'worker interrupted'",
+        "WHERE status = 'PROCESSING'",
+      ].join("\n"),
+    ).run({ maxAttempts });
+  }
+
+  public get(id: string): MemoryOutboxTask | undefined {
+    const row = this.database.prepare(
+      "SELECT * FROM memory_outbox WHERE id = ?",
+    ).get(id) as OutboxRow | undefined;
+
+    return row ? rowToTask(row) : undefined;
+  }
+
+  public list(): MemoryOutboxTask[] {
+    const rows = this.database.prepare(
+      "SELECT * FROM memory_outbox ORDER BY created_at ASC, id ASC",
+    ).all() as OutboxRow[];
+
+    return rows.map(rowToTask);
+  }
+
+  public countByStatus(status: MemoryOutboxStatus): number {
+    const row = this.database.prepare(
+      "SELECT count(*) AS count FROM memory_outbox WHERE status = ?",
+    ).get(status) as { count: number };
+
+    return row.count;
+  }
+
+  /** 人工确认外部服务恢复后，显式重新激活死信任务。 */
+  public requeueDeadLetter(id: string): void {
+    const result = this.database.prepare(
+      [
+        "UPDATE memory_outbox",
+        "SET status = 'PENDING', attempts = 0, last_error = NULL",
+        "WHERE id = ? AND status = 'DEAD_LETTER'",
+      ].join("\n"),
+    ).run(id);
+
+    if (result.changes !== 1) {
+      throw new Error(`Outbox 死信任务无法重新入队：${id}`);
+    }
+  }
+}
+~~~
+
+###### 24.4.11.4 理解每个仓储方法
+
+- `enqueue()`：利用一条 `INSERT ... SELECT ... WHERE NOT EXISTS` 避免重复活动任务。
+- `claimNext()`：在 SQLite 事务中完成“选择 + 改为 PROCESSING + attempts 加一”。
+- `complete()`：只有 PROCESSING 才允许变成 COMPLETED。
+- `fail()`：保存 `last_error`，达到重试上限时进入 DEAD_LETTER。
+- `recoverInterrupted(maxAttempts)`：恢复中断任务；耗尽次数时直接进入死信。
+- `requeueDeadLetter()`：必须由人工确认后调用，不允许扫描器自动绕过死信。
+
+这一版明确限制为同一个 SQLite 文件只有一个 worker。若部署多个 worker，还需要
+`locked_by`、`locked_at`、租约超时和多进程安全领取语义；运行中的 worker 存在时也不能
+调用 `recoverInterrupted(maxAttempts)`。
+
+`COMPLETED` 记录是审计证据，不要在 worker 中立即删除。数据量变大后另做归档或保留期
+策略，例如保留 90 天；归档任务不属于本节 worker 的职责。
+
+生产组装时，`SqliteDocumentStore` 和 `SqliteMemoryOutbox` 必须使用同一个 SQLite 文件；
+当前项目直接共享同一个 `Database` 实例最清楚：
+
+~~~ts
+const sqlite = new Database(config.MEMORY_SQLITE_PATH);
+const documents = new SqliteDocumentStore(sqlite);
+const outbox = new SqliteMemoryOutbox(sqlite);
+~~~
+
+不要给 outbox 使用 `:memory:`，同时让 documents 使用磁盘文件；那样 worker 重启后审计
+任务会全部丢失。`:memory:` 只用于单元测试。
+
+##### 24.4.12 把扫描结果转换成 outbox 任务
+
+###### 24.4.12.1 建立报告与操作的固定映射
+
+映射必须集中在一个函数里，不能散落在运行脚本中：
+
+| 扫描结果字段 | outbox operation | worker 最终动作 |
+|---|---|---|
+| `missingVectorIds` | `UPSERT_VECTOR` | 读 SQLite、生成 Embedding、upsert Qdrant |
+| `orphanVectorIds` | `DELETE_VECTOR` | 确认 SQLite 仍不存在后删除 Qdrant point |
+| `orphanGraphMemoryIds` | `DELETE_GRAPH` | 确认 SQLite 仍不存在后删除 Neo4j 关系 |
+
+新建 `src/memory/consistency/enqueue-consistency-repairs.ts`：
+
+~~~ts
+import type {
+  MemoryOutboxOperation,
+  SqliteMemoryOutbox,
+} from "./sqlite-memory-outbox.js";
+import type { MemoryConsistencyReport } from "./memory-consistency-types.js";
+
+export interface EnqueueConsistencyResult {
+  enqueuedTaskIds: string[];
+  duplicateTaskCount: number;
+}
+
+export function enqueueConsistencyRepairs(
+  report: MemoryConsistencyReport,
+  outbox: SqliteMemoryOutbox,
+): EnqueueConsistencyResult {
+  const enqueuedTaskIds: string[] = [];
+  let duplicateTaskCount = 0;
+
+  const enqueue = (
+    memoryId: string,
+    operation: MemoryOutboxOperation,
+  ): void => {
+    const id = outbox.enqueue(memoryId, operation);
+    if (id) enqueuedTaskIds.push(id);
+    else duplicateTaskCount += 1;
+  };
+
+  for (const id of report.missingVectorIds) enqueue(id, "UPSERT_VECTOR");
+  for (const id of report.orphanVectorIds) enqueue(id, "DELETE_VECTOR");
+  for (const id of report.orphanGraphMemoryIds) enqueue(id, "DELETE_GRAPH");
+
+  return { enqueuedTaskIds, duplicateTaskCount };
+}
+~~~
+
+###### 24.4.12.2 严格模式的正确调用顺序
+
+调用顺序只能是：
+
+~~~ts
+const report = await scanner.scan({ userId });
+const queued = enqueueConsistencyRepairs(report, outbox);
+
+console.info({ report, queued });
+~~~
+
+此处只入队，不调用 `scanner.scanAndRepair()`。入队后 Qdrant 和 Neo4j 应保持不变，直到
+worker 领取任务。
+
+`duplicateTaskCount` 不是错误。它表示上一次扫描已经为同一问题创建了未解决任务。记录
+这个数字即可，不要为重复问题再次创建任务。
+
+###### 24.4.12.3 本步骤的快速检查
+
+使用一个临时 SQLite 数据库手动验证：
+
+~~~ts
+const report = {
+  missingVectorIds: ["memory-a"],
+  orphanVectorIds: ["memory-b"],
+  orphanGraphMemoryIds: ["memory-c"],
+};
+
+const first = enqueueConsistencyRepairs(report, outbox);
+const second = enqueueConsistencyRepairs(report, outbox);
+
+console.log(first.enqueuedTaskIds.length); // 3
+console.log(first.duplicateTaskCount);     // 0
+console.log(second.enqueuedTaskIds.length); // 0
+console.log(second.duplicateTaskCount);     // 3
+~~~
+
+正式自动化测试放在 24.4.14。
+
+##### 24.4.13 实现独立 outbox worker
+
+###### 24.4.13.1 worker 的职责边界
+
+worker 每次只能处理一条已经进入 PROCESSING 的任务。它不负责重新扫描，也不负责生成
+新的 outbox 任务：
+
+~~~text
+领取任务 → 执行一个幂等远端动作 → 更新任务状态
+~~~
+
+任务可能已经排队几分钟甚至几小时，所以删除前必须重新查询 SQLite。SQLite 中如果已经
+出现同 ID 文档，说明这个 ID 不再是孤立数据，旧删除任务应按 no-op 成功完成，不能删除
+刚恢复的数据。
+
+###### 24.4.13.2 创建 worker 文件
+
+新建 `src/memory/consistency/memory-outbox-worker.ts`：
+
+~~~ts
+import type { EmbeddingClient } from "../embedding.js";
+import { createMemoryVectorRecord } from "../memory-vector-record.js";
+import type { DocumentStore } from "../storage/document-store.js";
+import type {
+  ConsistencyGraphStore,
+  ConsistencyVectorStore,
+} from "./consistency-store.js";
+import type { SqliteMemoryOutbox } from "./sqlite-memory-outbox.js";
+
+export interface MemoryOutboxRunResult {
+  completed: number;
+  failed: number;
+  deadLettered: number;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+export class MemoryOutboxWorker {
+  public constructor(
+    private readonly outbox: SqliteMemoryOutbox,
+    private readonly documents: DocumentStore,
+    private readonly vectors: ConsistencyVectorStore,
+    private readonly graph: ConsistencyGraphStore,
+    private readonly embeddings: EmbeddingClient,
+    private readonly maxAttempts = 5,
+  ) {
+    if (!Number.isInteger(maxAttempts) || maxAttempts <= 0) {
+      throw new Error("maxAttempts 必须是正整数");
+    }
+  }
+
+  public async runUntilEmpty(): Promise<MemoryOutboxRunResult> {
+    let completed = 0;
+    let failed = 0;
+    let deadLettered = 0;
+
+    while (true) {
+      const task = this.outbox.claimNext(this.maxAttempts);
+      if (!task) break;
+
+      try {
+        switch (task.operation) {
+          case "UPSERT_VECTOR": {
+            const item = await this.documents.get(task.memoryId);
+
+            /* 文档已被正常删除，原来的“缺向量”问题已经消失。 */
+            if (item) {
+              const vector = await this.embeddings.embed(item.content);
+              await this.vectors.upsert([
+                createMemoryVectorRecord(item, vector),
+              ]);
+            }
+            break;
+          }
+          case "DELETE_VECTOR": {
+            /* 任务可能排队很久；执行前重新检查权威来源。 */
+            const item = await this.documents.get(task.memoryId);
+            if (!item) await this.vectors.delete([task.memoryId]);
+            break;
+          }
+          case "DELETE_GRAPH": {
+            const item = await this.documents.get(task.memoryId);
+            if (!item) await this.graph.deleteByMemoryId(task.memoryId);
+            break;
+          }
+        }
+
+        this.outbox.complete(task.id);
+        completed += 1;
+      } catch (error: unknown) {
+        const deadLetter = task.attempts >= this.maxAttempts;
+        this.outbox.fail(task.id, errorMessage(error), deadLetter);
+        failed += 1;
+        if (deadLetter) deadLettered += 1;
+
+        /*
+         * 本轮不立即再次领取同一 FAILED 任务，避免外部服务故障时热循环。
+         * 由下一次定时运行继续重试。
+         */
+        break;
+      }
+    }
+
+    return { completed, failed, deadLettered };
+  }
+}
+~~~
+
+###### 24.4.13.3 理解三个操作为什么可重试
+
+`UPSERT_VECTOR`：
+
+~~~text
+每次都读取 SQLite 最新文档
+→ 用当前 EmbeddingClient 重新计算
+→ 使用固定 memoryId upsert
+~~~
+
+相同 ID 的 upsert 会覆盖同一 point，不会创建重复 point。若文档已经被删除，任务 no-op
+完成，因为“SQLite 有文档但缺向量”的前提已经消失。
+
+`DELETE_VECTOR`：
+
+~~~text
+先检查 SQLite 仍然没有文档
+→ 删除 point
+~~~
+
+删除已经不存在的 point 也应成功。
+
+`DELETE_GRAPH`：
+
+~~~text
+先检查 SQLite 仍然没有文档
+→ deleteByMemoryId(memoryId)
+~~~
+
+按 `memoryId` 删除零条或多条关系都应成功。
+
+###### 24.4.13.4 worker 启动与退出规则
+
+进程启动时先调用一次：
+
+~~~ts
+outbox.recoverInterrupted(maxAttempts);
+const result = await worker.runUntilEmpty();
+
+if (result.failed > 0) {
+  process.exitCode = 1;
+}
+~~~
+
+只有确认当前没有另一个 worker 正在运行时，才能调用 `recoverInterrupted(maxAttempts)`。它会把所有
+PROCESSING 任务视为上一次进程崩溃留下的任务。
+
+`upsert` 和两个 `delete` 都必须保持幂等，因此 worker 在“远端操作已成功、但写
+COMPLETED 前进程崩溃”后可以安全重试。达到 `maxAttempts` 后进入 `DEAD_LETTER`，必须
+报警并人工检查，不能继续对外宣称修复成功。
+
+由于当前表没有 `next_attempt_at`，本教程在第一次失败后结束本轮 worker，由下一次 cron
+或手动执行继续重试，避免外部服务故障时发生热循环。以后需要指数退避时，再增加
+`next_attempt_at` 并让 `claimNext()` 只领取到期任务。
+
+##### 24.4.14 outbox 测试顺序
+
+不要一开始就连接真实 Qdrant 和 Neo4j。按“仓储 → 映射 → worker → 真实集成”的顺序
+测试，失败时才能快速定位层次。
+
+###### 24.4.14.1 测试 SqliteMemoryOutbox 状态机
+
+创建 `tests/sqlite-memory-outbox.test.ts`：
+
+~~~ts
+import Database from "better-sqlite3";
+import { describe, expect, it } from "vitest";
+import { SqliteMemoryOutbox } from "../src/memory/consistency/sqlite-memory-outbox.js";
+
+function createSubject() {
+  const database = new Database(":memory:");
+  const now = () => new Date("2026-08-20T10:00:00.000Z");
+  const outbox = new SqliteMemoryOutbox(database, now);
+  return { database, outbox };
+}
+
+describe("SqliteMemoryOutbox", () => {
+  it("迁移表、去重活动任务并允许已完成任务再次创建", () => {
+    const { database, outbox } = createSubject();
+
+    try {
+      const firstId = outbox.enqueue("memory-1", "DELETE_VECTOR", {
+        reason: "orphan",
+      });
+      const duplicateId = outbox.enqueue("memory-1", "DELETE_VECTOR");
+
+      expect(firstId).toEqual(expect.any(String));
+      expect(duplicateId).toBeUndefined();
+      expect(outbox.list()).toHaveLength(1);
+      expect(outbox.get(firstId!)).toMatchObject({
+        id: firstId,
+        memoryId: "memory-1",
+        operation: "DELETE_VECTOR",
+        payload: { reason: "orphan" },
+        status: "PENDING",
+        attempts: 0,
+        createdAt: "2026-08-20T10:00:00.000Z",
+      });
+
+      const claimed = outbox.claimNext(3);
+      expect(claimed).toMatchObject({
+        id: firstId,
+        status: "PROCESSING",
+        attempts: 1,
+      });
+
+      outbox.complete(firstId!);
+      expect(outbox.get(firstId!)?.status).toBe("COMPLETED");
+
+      /* COMPLETED 已解决，因此未来再次漂移时允许创建新任务。 */
+      const newId = outbox.enqueue("memory-1", "DELETE_VECTOR");
+      expect(newId).toEqual(expect.any(String));
+      expect(newId).not.toBe(firstId);
+      expect(outbox.list()).toHaveLength(2);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("失败任务可重试，达到上限后进入死信", () => {
+    const { database, outbox } = createSubject();
+
+    try {
+      const id = outbox.enqueue("memory-2", "DELETE_GRAPH");
+      expect(id).toEqual(expect.any(String));
+
+      const firstAttempt = outbox.claimNext(2);
+      expect(firstAttempt?.attempts).toBe(1);
+      outbox.fail(firstAttempt!.id, "Neo4j unavailable", false);
+
+      expect(outbox.get(id!)).toMatchObject({
+        status: "FAILED",
+        attempts: 1,
+        lastError: "Neo4j unavailable",
+      });
+
+      const secondAttempt = outbox.claimNext(2);
+      expect(secondAttempt?.attempts).toBe(2);
+      outbox.fail(secondAttempt!.id, "Neo4j unavailable", true);
+
+      expect(outbox.get(id!)).toMatchObject({
+        status: "DEAD_LETTER",
+        attempts: 2,
+        lastError: "Neo4j unavailable",
+      });
+      expect(outbox.claimNext(2)).toBeUndefined();
+
+      /* 死信未人工处理前，扫描器不能绕过它创建重复任务。 */
+      expect(
+        outbox.enqueue("memory-2", "DELETE_GRAPH"),
+      ).toBeUndefined();
+
+      outbox.requeueDeadLetter(id!);
+      expect(outbox.get(id!)).toMatchObject({
+        status: "PENDING",
+        attempts: 0,
+      });
+    } finally {
+      database.close();
+    }
+  });
+
+  it("单 worker 重启时恢复中断任务", () => {
+    const { database, outbox } = createSubject();
+
+    try {
+      const id = outbox.enqueue("memory-3", "UPSERT_VECTOR");
+      expect(outbox.claimNext(3)?.status).toBe("PROCESSING");
+
+      outbox.recoverInterrupted(3);
+
+      expect(outbox.get(id!)).toMatchObject({
+        status: "FAILED",
+        attempts: 1,
+        lastError: "worker interrupted",
+      });
+    } finally {
+      database.close();
+    }
+  });
+});
+~~~
+
+运行：
+
+~~~bash
+npx vitest run tests/sqlite-memory-outbox.test.ts
+~~~
+
+第一个测试使用 `firstId!` 是因为前面已经断言首次入队一定返回字符串。在业务实现中仍应
+避免无条件使用非空断言。
+
+###### 24.4.14.2 测试报告到任务的映射和重复入队
+
+创建 `tests/enqueue-consistency-repairs.test.ts`：
+
+~~~ts
+import Database from "better-sqlite3";
+import { describe, expect, it } from "vitest";
+import { enqueueConsistencyRepairs } from "../src/memory/consistency/enqueue-consistency-repairs.js";
+import { SqliteMemoryOutbox } from "../src/memory/consistency/sqlite-memory-outbox.js";
+
+describe("enqueueConsistencyRepairs", () => {
+  it("把三类不一致映射成三类 outbox 任务并去重", () => {
+    const database = new Database(":memory:");
+    const outbox = new SqliteMemoryOutbox(database);
+    const report = {
+      missingVectorIds: ["missing-vector"],
+      orphanVectorIds: ["orphan-vector"],
+      orphanGraphMemoryIds: ["orphan-graph"],
+    };
+
+    try {
+      const first = enqueueConsistencyRepairs(report, outbox);
+
+      expect(first.enqueuedTaskIds).toHaveLength(3);
+      expect(first.duplicateTaskCount).toBe(0);
+      expect(
+        outbox
+          .list()
+          .map((task) => `${task.operation}:${task.memoryId}`)
+          .sort(),
+      ).toEqual([
+        "DELETE_GRAPH:orphan-graph",
+        "DELETE_VECTOR:orphan-vector",
+        "UPSERT_VECTOR:missing-vector",
+      ]);
+      expect(
+        outbox.list().every((task) => task.status === "PENDING"),
+      ).toBe(true);
+
+      const second = enqueueConsistencyRepairs(report, outbox);
+
+      expect(second.enqueuedTaskIds).toEqual([]);
+      expect(second.duplicateTaskCount).toBe(3);
+      expect(outbox.list()).toHaveLength(3);
+    } finally {
+      database.close();
+    }
+  });
+});
+~~~
+
+运行：
+
+~~~bash
+npx vitest run tests/enqueue-consistency-repairs.test.ts
+~~~
+
+###### 24.4.14.3 测试 worker 的成功、过期任务保护和死信
+
+创建 `tests/memory-outbox-worker.test.ts`：
+
+~~~ts
+import Database from "better-sqlite3";
+import { describe, expect, it } from "vitest";
+import { HashEmbeddingClient } from "../src/memory/embedding.js";
+import { MemoryOutboxWorker } from "../src/memory/consistency/memory-outbox-worker.js";
+import { SqliteMemoryOutbox } from "../src/memory/consistency/sqlite-memory-outbox.js";
+import { InMemoryDocumentStore } from "../src/memory/storage/document-store.js";
+import type { VectorRecord } from "../src/memory/storage/vector-store.js";
+
+class FakeWorkerVectorStore {
+  public readonly records = new Map<string, VectorRecord>();
+  public readonly failedDeleteIds = new Set<string>();
+
+  public async listMemoryIds(): Promise<string[]> {
+    return [...this.records.keys()].sort();
+  }
+
+  public async upsert(records: VectorRecord[]): Promise<void> {
+    for (const record of records) {
+      this.records.set(record.id, structuredClone(record));
+    }
+  }
+
+  public async delete(ids: string[]): Promise<void> {
+    for (const id of ids) {
+      if (this.failedDeleteIds.has(id)) {
+        throw new Error(`模拟 Qdrant 删除失败：${id}`);
+      }
+      this.records.delete(id);
+    }
+  }
+}
+
+class FakeWorkerGraphStore {
+  public readonly memoryIds = new Set<string>();
+
+  public async listMemoryIds(): Promise<string[]> {
+    return [...this.memoryIds].sort();
+  }
+
+  public async deleteByMemoryId(memoryId: string): Promise<void> {
+    this.memoryIds.delete(memoryId);
+  }
+}
+
+function createSubject(maxAttempts = 3) {
+  const database = new Database(":memory:");
+  const outbox = new SqliteMemoryOutbox(database);
+  const documents = new InMemoryDocumentStore();
+  const vectors = new FakeWorkerVectorStore();
+  const graph = new FakeWorkerGraphStore();
+  const worker = new MemoryOutboxWorker(
+    outbox,
+    documents,
+    vectors,
+    graph,
+    new HashEmbeddingClient(8),
+    maxAttempts,
+  );
+
+  return {
+    database,
+    outbox,
+    documents,
+    vectors,
+    graph,
+    worker,
+  };
+}
+
+describe("MemoryOutboxWorker", () => {
+  it("完成补向量、删孤立向量和删孤立图关系", async () => {
+    const subject = createSubject();
+
+    try {
+      await subject.documents.add({
+        id: "missing-vector",
+        content: "用户喜欢 TypeScript",
+        memoryType: "semantic",
+        userId: "user-1",
+        timestamp: "2026-08-20T10:00:00.000Z",
+        importance: 0.9,
+        metadata: { source: "worker-test" },
+      });
+      await subject.vectors.upsert([
+        {
+          id: "orphan-vector",
+          vector: new Array(8).fill(0),
+          metadata: { memoryId: "orphan-vector" },
+        },
+      ]);
+      subject.graph.memoryIds.add("orphan-graph");
+
+      subject.outbox.enqueue("missing-vector", "UPSERT_VECTOR");
+      subject.outbox.enqueue("orphan-vector", "DELETE_VECTOR");
+      subject.outbox.enqueue("orphan-graph", "DELETE_GRAPH");
+
+      await expect(subject.worker.runUntilEmpty()).resolves.toEqual({
+        completed: 3,
+        failed: 0,
+        deadLettered: 0,
+      });
+
+      expect(subject.vectors.records.has("missing-vector")).toBe(true);
+      expect(subject.vectors.records.has("orphan-vector")).toBe(false);
+      expect(subject.graph.memoryIds.has("orphan-graph")).toBe(false);
+      expect(
+        subject.outbox.list().every(
+          (task) => task.status === "COMPLETED" && task.attempts === 1,
+        ),
+      ).toBe(true);
+    } finally {
+      subject.database.close();
+    }
+  });
+
+  it("删除任务过期时保留 SQLite 已恢复的数据", async () => {
+    const subject = createSubject();
+
+    try {
+      await subject.documents.add({
+        id: "restored-memory",
+        content: "这条记忆已经恢复",
+        memoryType: "semantic",
+        userId: "user-1",
+        timestamp: "2026-08-20T10:00:00.000Z",
+        importance: 0.8,
+        metadata: {},
+      });
+      await subject.vectors.upsert([
+        {
+          id: "restored-memory",
+          vector: new Array(8).fill(0),
+          metadata: { memoryId: "restored-memory" },
+        },
+      ]);
+      subject.graph.memoryIds.add("restored-memory");
+
+      subject.outbox.enqueue("restored-memory", "DELETE_VECTOR");
+      subject.outbox.enqueue("restored-memory", "DELETE_GRAPH");
+
+      await subject.worker.runUntilEmpty();
+
+      expect(subject.vectors.records.has("restored-memory")).toBe(true);
+      expect(subject.graph.memoryIds.has("restored-memory")).toBe(true);
+      expect(
+        subject.outbox.list().every((task) => task.status === "COMPLETED"),
+      ).toBe(true);
+    } finally {
+      subject.database.close();
+    }
+  });
+
+  it("保存失败原因并在达到上限后进入死信", async () => {
+    const subject = createSubject(2);
+
+    try {
+      await subject.vectors.upsert([
+        {
+          id: "cannot-delete",
+          vector: new Array(8).fill(0),
+          metadata: { memoryId: "cannot-delete" },
+        },
+      ]);
+      subject.vectors.failedDeleteIds.add("cannot-delete");
+      const taskId = subject.outbox.enqueue(
+        "cannot-delete",
+        "DELETE_VECTOR",
+      );
+
+      await expect(subject.worker.runUntilEmpty()).resolves.toEqual({
+        completed: 0,
+        failed: 1,
+        deadLettered: 0,
+      });
+      expect(subject.outbox.get(taskId!)).toMatchObject({
+        status: "FAILED",
+        attempts: 1,
+        lastError: "模拟 Qdrant 删除失败：cannot-delete",
+      });
+
+      await expect(subject.worker.runUntilEmpty()).resolves.toEqual({
+        completed: 0,
+        failed: 1,
+        deadLettered: 1,
+      });
+      expect(subject.outbox.get(taskId!)).toMatchObject({
+        status: "DEAD_LETTER",
+        attempts: 2,
+      });
+
+      /* 死信不会被第三轮自动领取。 */
+      await expect(subject.worker.runUntilEmpty()).resolves.toEqual({
+        completed: 0,
+        failed: 0,
+        deadLettered: 0,
+      });
+    } finally {
+      subject.database.close();
+    }
+  });
+});
+~~~
+
+运行：
+
+~~~bash
+npx vitest run tests/memory-outbox-worker.test.ts
+~~~
+
+“过期任务保护”测试不可省略。outbox 将扫描和修复分成两个时间点，如果 worker 不重新检查
+SQLite，就可能执行一个已经失效的删除决定。
+
+###### 24.4.14.4 运行全部 outbox 单元测试
+
+~~~bash
+npx vitest run \
+  tests/sqlite-memory-outbox.test.ts \
+  tests/enqueue-consistency-repairs.test.ts \
+  tests/memory-outbox-worker.test.ts
+npm run typecheck
+~~~
+
+Windows PowerShell 可以分开运行三个文件，或者直接使用 `npm test`。
+
+###### 24.4.14.5 做真实 outbox 端到端演练
+
+复制 24.4.10 的测试文件，命名为：
+
+~~~text
+tests/memory-consistency-outbox.integration.test.ts
+~~~
+
+保留其中所有真实连接、随机 ID、三种漂移注入、物理检查和 `finally` 清理代码。然后完成
+以下修改。
+
+第一处，增加导入：
+
+~~~ts
+import { enqueueConsistencyRepairs } from "../src/memory/consistency/enqueue-consistency-repairs.js";
+import { MemoryOutboxWorker } from "../src/memory/consistency/memory-outbox-worker.js";
+import { SqliteMemoryOutbox } from "../src/memory/consistency/sqlite-memory-outbox.js";
+~~~
+
+第二处，在创建 `scanner` 后创建 outbox 和 worker：
+
+~~~ts
+const outbox = new SqliteMemoryOutbox(sqlite);
+const worker = new MemoryOutboxWorker(
+  outbox,
+  documents,
+  vectors,
+  graph,
+  embeddings,
+  3,
+);
+~~~
+
+第三处，保留三种漂移注入和 `reportBefore` 断言，删除原测试中直接调用
+`scanner.scanAndRepair()` 的部分，替换为：
+
+~~~ts
+/* 第一步：扫描结果只进入 outbox。 */
+const queued = enqueueConsistencyRepairs(reportBefore, outbox);
+
+expect(queued.enqueuedTaskIds).toHaveLength(3);
+expect(queued.duplicateTaskCount).toBe(0);
+expect(
+  outbox.list().map((task) => task.status),
+).toEqual(["PENDING", "PENDING", "PENDING"]);
+
+/* 第二步：重复入队不会产生另外三行。 */
+const duplicate = enqueueConsistencyRepairs(reportBefore, outbox);
+expect(duplicate.enqueuedTaskIds).toEqual([]);
+expect(duplicate.duplicateTaskCount).toBe(3);
+expect(outbox.list()).toHaveLength(3);
+
+/*
+ * 第三步：入队阶段不能修改外部后端。
+ * 缺失向量仍然缺失、孤立向量和孤立图关系仍然存在。
+ */
+expect(
+  await retrievePoint(qdrant, collectionName, missingVectorId),
+).toEqual([]);
+expect(
+  await retrievePoint(qdrant, collectionName, orphanVectorId),
+).toHaveLength(1);
+expect(
+  await countGraphRelations(driver, neo4jDatabase, orphanGraphId),
+).toBe(1);
+
+/* 第四步：只有 worker 执行实际修复。 */
+const workerResult = await worker.runUntilEmpty();
+
+expect(workerResult).toEqual({
+  completed: 3,
+  failed: 0,
+  deadLettered: 0,
+});
+expect(
+  outbox.list().every(
+    (task) => task.status === "COMPLETED" && task.attempts === 1,
+  ),
+).toBe(true);
+
+/* 第五步：重新扫描应无不一致。 */
+await expect(scanner.scan({ userId })).resolves.toEqual({
+  missingVectorIds: [],
+  orphanVectorIds: [],
+  orphanGraphMemoryIds: [],
+});
+
+/* 第六步：直接检查三个后端，不只相信扫描报告。 */
+expect(await documents.get(missingVectorId)).toBeDefined();
+
+const repairedVector = await retrievePoint(
+  qdrant,
+  collectionName,
+  missingVectorId,
+);
+expect(repairedVector).toHaveLength(1);
+expect(repairedVector[0]?.payload).toMatchObject({
+  memoryId: missingVectorId,
+  userId,
+  memoryType: "semantic",
+});
+
+expect(
+  await retrievePoint(qdrant, collectionName, orphanVectorId),
+).toEqual([]);
+expect(
+  await countGraphRelations(driver, neo4jDatabase, orphanGraphId),
+).toBe(0);
+~~~
+
+注意：`outbox.list()` 按 `created_at, id` 排序，三个任务的 operation 顺序不应作为集成测试
+断言；这里只检查状态全部为 PENDING/COMPLETED。
+
+运行：
+
+~~~bash
+RUN_MEMORY_INTEGRATION_TESTS=true npx vitest run tests/memory-consistency-outbox.integration.test.ts
+~~~
+
+再运行全部集成测试：
+
+~~~bash
+npm run test:memory:integration
+~~~
+
+###### 24.4.14.6 添加导出
+
+所有测试通过后，在 `src/memory/index.ts` 增加：
+
+~~~ts
+export {
+  enqueueConsistencyRepairs,
+} from "./consistency/enqueue-consistency-repairs.js";
+export type {
+  EnqueueConsistencyResult,
+} from "./consistency/enqueue-consistency-repairs.js";
+export {
+  MemoryOutboxWorker,
+} from "./consistency/memory-outbox-worker.js";
+export type {
+  MemoryOutboxRunResult,
+} from "./consistency/memory-outbox-worker.js";
+export {
+  SqliteMemoryOutbox,
+} from "./consistency/sqlite-memory-outbox.js";
+export type {
+  MemoryOutboxOperation,
+  MemoryOutboxStatus,
+  MemoryOutboxTask,
+} from "./consistency/sqlite-memory-outbox.js";
+~~~
+
+###### 24.4.14.7 最终验收顺序
+
+按下面顺序运行，不要只运行最后一条：
+
+~~~bash
+npm run typecheck
+npx vitest run tests/sqlite-memory-outbox.test.ts
+npx vitest run tests/enqueue-consistency-repairs.test.ts
+npx vitest run tests/memory-outbox-worker.test.ts
+npm test
+docker compose -f docker-compose.memory.yml up -d
+RUN_MEMORY_INTEGRATION_TESTS=true npx vitest run tests/memory-consistency-outbox.integration.test.ts
+npm run test:memory:integration
+~~~
+
+本阶段完成标准：
+
+~~~text
+[ ] outbox 自己负责迁移 memory_outbox 表
+[ ] 重复扫描不会创建重复未解决任务
+[ ] scan + enqueue 阶段不会修改 Qdrant/Neo4j
+[ ] worker 成功后任务为 COMPLETED
+[ ] worker 失败后保存 attempts 和 last_error
+[ ] 达到重试上限后进入 DEAD_LETTER
+[ ] 过期删除任务不会删除 SQLite 已恢复的数据
+[ ] 真实 worker 修复后三个物理后端符合 SQLite 权威状态
+[ ] worker 失败时进程退出码非 0，不会报告成功
+~~~
+
+##### 24.4.15 组装并提供手动执行入口
+
+严格 Outbox 模式复用生产工厂创建的 SQLite、Qdrant、Neo4j 和 Embedding 依赖，不在命令
+脚本中复制连接代码。
+
+`ProductionMemoryRuntime` 应同时返回：
+
+~~~ts
+export interface ProductionMemoryRuntime {
+  manager: MemoryManager;
+  consistencyScanner: MemoryConsistencyScanner;
+  consistencyOutbox: SqliteMemoryOutbox;
+  outboxWorker: MemoryOutboxWorker;
+  close(): Promise<void>;
+}
+~~~
+
+`SqliteDocumentStore` 和 `SqliteMemoryOutbox` 必须共享同一个 SQLite 实例：
+
+~~~ts
+const documents = new SqliteDocumentStore(sqlite);
+const consistencyOutbox = new SqliteMemoryOutbox(sqlite, now);
+~~~
+
+创建 scanner 后，再创建 worker：
+
+~~~ts
+const outboxWorker = new MemoryOutboxWorker(
+  consistencyOutbox,
+  documents,
+  vectors,
+  graph,
+  embeddings,
+  options.infrastructure.MEMORY_OUTBOX_MAX_ATTEMPTS,
+);
+~~~
+
+提供三个职责单一的入口：
+
+~~~text
+src/examples/memory-consistency.ts          只读扫描
+src/examples/memory-consistency-enqueue.ts  扫描并写入 outbox
+src/examples/memory-outbox-worker.ts        执行 outbox 任务
+~~~
+
+严格模式不再使用 `MEMORY_CONSISTENCY_REPAIR`，也不从命令入口调用
+`scanAndRepair()`。入队入口执行：
+
+~~~ts
+const report = await runtime.consistencyScanner.scan(options);
+const queued = enqueueConsistencyRepairs(
+  report,
+  runtime.consistencyOutbox,
+);
+~~~
+
+worker 入口先恢复中断任务，再执行队列：
+
+~~~ts
+runtime.consistencyOutbox.recoverInterrupted(
+  infrastructure.MEMORY_OUTBOX_MAX_ATTEMPTS,
+);
+const result = await runtime.outboxWorker.runUntilEmpty();
+const deadLetterCount =
+  runtime.consistencyOutbox.countByStatus("DEAD_LETTER");
+
+if (result.failed > 0 || deadLetterCount > 0) {
+  process.exitCode = 1;
+}
+~~~
+
+在 `package.json` 中增加：
+
+~~~json
+"memory:consistency": "npm run memory:consistency:scan",
+"memory:consistency:scan": "tsx src/examples/memory-consistency.ts",
+"memory:consistency:enqueue": "tsx src/examples/memory-consistency-enqueue.ts",
+"memory:outbox:work": "tsx src/examples/memory-outbox-worker.ts"
+~~~
+
+手动执行顺序：
+
+~~~bash
+# 第一步：只读扫描并人工检查报告
+MEMORY_SCAN_USER_ID=user-123 npm run memory:consistency:scan
+
+# 第二步：再次扫描并把修复动作写入 outbox
+MEMORY_SCAN_USER_ID=user-123 npm run memory:consistency:enqueue
+
+# 第三步：独立 worker 执行任务
+npm run memory:outbox:work
+
+# 第四步：重新扫描，三个数组应为空
+MEMORY_SCAN_USER_ID=user-123 npm run memory:consistency:scan
+~~~
+
+生产环境推荐按 `userId` 分批运行。全量扫描会把三个 ID 集合保存在 Node.js 内存中，
+数据量较大时应进一步改成游标分片和批量对账。
+
+##### 24.4.16 最终运行方式和验收标准
+
+推荐把扫描、入队和 worker 作为三个独立命令，而不是挂在每次 Agent 请求上：
+
+~~~text
+memory:consistency:scan      只读扫描并输出报告
+memory:consistency:enqueue   扫描并把修复动作写入 outbox
+memory:outbox:work           执行已记录的修复任务
+~~~
+
+基础版完成标准：
+
+~~~text
+[ ] Qdrant scroll 能跨两页返回全部 memoryId
+[ ] Neo4j 对多条关系只返回一个 DISTINCT memoryId
+[ ] scan() 本身绝不写三个后端
+[ ] 缺失向量使用当前 EmbeddingClient 和统一 payload 重建
+[ ] 两类孤立数据能够幂等删除
+[ ] 任一修复失败都会抛错，并带有 failures/after 报告
+[ ] 单元测试通过
+[ ] 真实 SQLite + Qdrant + Neo4j 漂移演练通过
+~~~
+
+严格 outbox 版额外完成标准：
+
+~~~text
+[ ] 扫描阶段只写 SQLite outbox，不直接修复
+[ ] 重复扫描不会产生重复活动任务
+[ ] 每次尝试次数和最后错误可审计
+[ ] worker 中断后任务可恢复
+[ ] 达到重试上限进入 DEAD_LETTER 并报警
+[ ] worker 完成后重新 scan() 无残留不一致
+~~~
+
+outbox 属于可靠性增强，不要在四个适配器和基础扫描器尚未分别通过测试前提前实现。
 
 ~~~ts
 interface MemoryConsistencyReport {

@@ -46,11 +46,7 @@ function payloadToMetadata(
 }
 
 function readUnnamedVectorSize(vectors: unknown): number | undefined {
-  if (
-    typeof vectors !== "object" ||
-    vectors === null ||
-    !("size" in vectors)
-  ) {
+  if (typeof vectors !== "object" || vectors === null || !("size" in vectors)) {
     return undefined;
   }
 
@@ -75,15 +71,12 @@ export class QdrantVectorStore implements VectorStore {
     );
 
     if (!exists) {
-      await this.options.client.createCollection(
-        this.options.collectionName,
-        {
-          vectors: {
-            size: this.options.dimension,
-            distance: "Cosine",
-          },
+      await this.options.client.createCollection(this.options.collectionName, {
+        vectors: {
+          size: this.options.dimension,
+          distance: "Cosine",
         },
-      );
+      });
     } else {
       const collection = await this.options.client.getCollection(
         this.options.collectionName,
@@ -190,5 +183,66 @@ export class QdrantVectorStore implements VectorStore {
       wait: true,
       filter: buildFilter(filter),
     });
+  }
+
+  public async listMemoryIds(userId?: string): Promise<string[]> {
+    await this.ready;
+
+    const ids = new Set<string>();
+    let offset: string | number | undefined;
+
+    do {
+      const page = await this.options.client.scroll(
+        this.options.collectionName,
+        {
+          limit: 256,
+          ...(offset === undefined ? {} : { offset }),
+          ...(userId
+            ? {
+                filter: {
+                  must: [
+                    {
+                      key: "userId",
+                      match: { value: userId },
+                    },
+                  ],
+                },
+              }
+            : {}),
+          with_payload: true,
+          with_vector: false,
+        },
+      );
+
+      for (const point of page.points) {
+        const memoryId = point.payload?.memoryId;
+
+        if (typeof memoryId !== "string" || memoryId.length === 0) {
+          throw new Error(
+            `Qdrant point 缺少合法 memoryId：${String(point.id)}`,
+          );
+        }
+
+        /*
+         * 当前项目约定 Qdrant point.id 与 payload.memoryId 都等于记忆 ID。
+         * 不满足约定的 point 不能安全地交给 delete([memoryId]) 修复。
+         */
+        if (String(point.id) !== memoryId) {
+          throw new Error(
+            `Qdrant point ID 与 memoryId 不一致：${String(point.id)} != ${memoryId}`,
+          );
+        }
+
+        ids.add(memoryId);
+      }
+
+      const nextOffset = page.next_page_offset;
+      offset =
+        typeof nextOffset === "string" || typeof nextOffset === "number"
+          ? nextOffset
+          : undefined;
+    } while (offset !== undefined);
+
+    return [...ids].sort();
   }
 }

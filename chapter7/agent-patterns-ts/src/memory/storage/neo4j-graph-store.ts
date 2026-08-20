@@ -83,9 +83,7 @@ export class Neo4jGraphStore implements GraphStore {
     );
 
     if (result.records.length !== 1) {
-      throw new Error(
-        `无法创建关系 ${relation.id}：源实体或目标实体不存在`,
-      );
+      throw new Error(`无法创建关系 ${relation.id}：源实体或目标实体不存在`);
     }
   }
 
@@ -173,5 +171,27 @@ export class Neo4jGraphStore implements GraphStore {
       { userId },
       { database: this.options.database },
     );
+  }
+
+  public async listMemoryIds(userId?: string): Promise<string[]> {
+    await this.ready;
+
+    const result = await this.options.driver.executeQuery(
+      [
+        "MATCH ()-[edge:MEMORY_RELATION]->()",
+        "WHERE $userId IS NULL OR edge.userId = $userId",
+        "RETURN DISTINCT edge.memoryId AS memoryId",
+        "ORDER BY memoryId",
+      ].join("\n"),
+      { userId: userId ?? null },
+      { database: this.options.database },
+    );
+
+    return result.records
+      .map((record) => record.get("memoryId"))
+      .filter(
+        (memoryId): memoryId is string =>
+          typeof memoryId === "string" && memoryId.length > 0,
+      );
   }
 }

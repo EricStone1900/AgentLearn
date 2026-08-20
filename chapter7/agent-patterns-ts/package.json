@@ -19,7 +19,11 @@
     "demo:memory:function": "tsx src/examples/memory-function-call-demo.ts",
     "demo:memory:tool": "tsx src/examples/memory-simple-agent-demo.ts",
     "demo:memory:production": "tsx src/examples/production-memory-demo.ts",
-    "test:memory:integration": "RUN_MEMORY_INTEGRATION_TESTS=true vitest run tests/*.integration.test.ts"
+    "test:memory:integration": "RUN_MEMORY_INTEGRATION_TESTS=true vitest run tests/*.integration.test.ts",
+    "memory:consistency": "npm run memory:consistency:scan",
+    "memory:consistency:scan": "tsx src/examples/memory-consistency.ts",
+    "memory:consistency:enqueue": "tsx src/examples/memory-consistency-enqueue.ts",
+    "memory:outbox:work": "tsx src/examples/memory-outbox-worker.ts"
   },
   "dependencies": {
     "@qdrant/js-client-rest": "^1.19.0",

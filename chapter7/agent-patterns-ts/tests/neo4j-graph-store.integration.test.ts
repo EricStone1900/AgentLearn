@@ -87,11 +87,29 @@ describeIntegration("Neo4jGraphStore integration", () => {
       );
       await store.addRelation(
         relation(
+          userOne,
+          oneSource.id,
+          oneTarget.id,
+          userOneMemoryId,
+        ),
+      );
+      await store.addRelation(
+        relation(
           userTwo,
           twoSource.id,
           twoTarget.id,
           userTwoMemoryId,
         ),
+      );
+
+      expect(await store.listMemoryIds(userOne)).toEqual([
+        userOneMemoryId,
+      ]);
+      expect(await store.listMemoryIds(userTwo)).toEqual([
+        userTwoMemoryId,
+      ]);
+      expect(await store.listMemoryIds()).toEqual(
+        [userOneMemoryId, userTwoMemoryId].sort(),
       );
 
       const userOneHits = await store.findRelatedMemories(

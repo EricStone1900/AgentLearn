@@ -24,7 +24,22 @@ describe("loadProductionMemoryConfig", () => {
     const config = loadProductionMemoryConfig(validEnv());
 
     expect(config.EMBEDDING_DIMENSION).toBe(1024);
+    expect(config.MEMORY_OUTBOX_MAX_ATTEMPTS).toBe(5);
     expect(config.QDRANT_API_KEY).toBeUndefined();
+  });
+
+  it("能够配置 Outbox 最大尝试次数", () => {
+    const env = validEnv();
+    env.MEMORY_OUTBOX_MAX_ATTEMPTS = "8";
+
+    expect(
+      loadProductionMemoryConfig(env).MEMORY_OUTBOX_MAX_ATTEMPTS,
+    ).toBe(8);
+
+    env.MEMORY_OUTBOX_MAX_ATTEMPTS = "0";
+    expect(() => loadProductionMemoryConfig(env)).toThrow(
+      "第二阶段记忆系统环境变量不完整",
+    );
   });
 
   it("可以切换其他兼容厂商、模型和维度", () => {

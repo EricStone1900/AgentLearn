@@ -59,4 +59,57 @@ describeIntegration("QdrantVectorStore integration", () => {
       await client.deleteCollection(collectionName);
     }
   });
+
+  it("分页枚举全部 memoryId 并按 userId 隔离", async () => {
+    const dimension = 4;
+    const collectionName = `test_scroll_${randomUUID().replaceAll("-", "_")}`;
+    const client = new QdrantClient({
+      url: process.env.QDRANT_URL ?? "http://127.0.0.1:6333",
+      ...(process.env.QDRANT_API_KEY
+        ? { apiKey: process.env.QDRANT_API_KEY }
+        : {}),
+    });
+    const store = new QdrantVectorStore({
+      client,
+      collectionName,
+      dimension,
+    });
+    const expectedIds = Array.from({ length: 257 }, () => randomUUID());
+    const otherUserId = randomUUID();
+
+    try {
+      await store.upsert([
+        ...expectedIds.map((id) => ({
+          id,
+          vector: [1, 0, 0, 0],
+          metadata: {
+            memoryId: id,
+            userId: "pagination-user",
+            memoryType: "semantic",
+          },
+        })),
+        {
+          id: otherUserId,
+          vector: [1, 0, 0, 0],
+          metadata: {
+            memoryId: otherUserId,
+            userId: "other-user",
+            memoryType: "semantic",
+          },
+        },
+      ]);
+
+      await expect(
+        store.listMemoryIds("pagination-user"),
+      ).resolves.toEqual([...expectedIds].sort());
+      await expect(store.listMemoryIds("other-user")).resolves.toEqual([
+        otherUserId,
+      ]);
+      await expect(store.listMemoryIds()).resolves.toEqual(
+        [...expectedIds, otherUserId].sort(),
+      );
+    } finally {
+      await client.deleteCollection(collectionName);
+    }
+  }, 60_000);
 });

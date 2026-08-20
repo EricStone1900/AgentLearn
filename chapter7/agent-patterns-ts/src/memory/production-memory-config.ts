@@ -8,6 +8,7 @@ const optionalNonEmptyString = z.preprocess((value) => {
 
 const productionMemoryEnvSchema = z.object({
   MEMORY_SQLITE_PATH: z.string().trim().min(1),
+  MEMORY_OUTBOX_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),
 
   EMBEDDING_API_KEY: z.string().trim().min(1),
   EMBEDDING_BASE_URL: z

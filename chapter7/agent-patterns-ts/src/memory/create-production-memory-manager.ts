@@ -2,14 +2,14 @@ import Database from "better-sqlite3";
 import { QdrantClient } from "@qdrant/js-client-rest";
 import neo4j, { type Driver } from "neo4j-driver";
 import OpenAI from "openai";
+import { MemoryConsistencyScanner } from "./consistency/memory-consistency-scanner.js";
+import { MemoryOutboxWorker } from "./consistency/memory-outbox-worker.js";
+import { SqliteMemoryOutbox } from "./consistency/sqlite-memory-outbox.js";
 import { RuleBasedKnowledgeExtractor } from "./knowledge-extractor.js";
 import { MemoryManager } from "./manager.js";
 import { OpenAiCompatibleEmbeddingClient } from "./openai-compatible-embedding.js";
 import type { ProductionMemoryConfig } from "./production-memory-config.js";
-import {
-  createDefaultMemoryConfig,
-  memoryConfigSchema,
-} from "./schemas.js";
+import { createDefaultMemoryConfig, memoryConfigSchema } from "./schemas.js";
 import type { MemoryConfig } from "./schemas.js";
 import { Neo4jGraphStore } from "./storage/neo4j-graph-store.js";
 import { QdrantVectorStore } from "./storage/qdrant-vector-store.js";
@@ -28,9 +28,11 @@ export interface CreateProductionMemoryManagerOptions {
 
 export interface ProductionMemoryRuntime {
   manager: MemoryManager;
+  consistencyScanner: MemoryConsistencyScanner;
+  consistencyOutbox: SqliteMemoryOutbox;
+  outboxWorker: MemoryOutboxWorker;
   close(): Promise<void>;
 }
-
 export async function createProductionMemoryManager(
   options: CreateProductionMemoryManagerOptions,
 ): Promise<ProductionMemoryRuntime> {
@@ -45,6 +47,7 @@ export async function createProductionMemoryManager(
 
   try {
     const documents = new SqliteDocumentStore(sqlite);
+    const consistencyOutbox = new SqliteMemoryOutbox(sqlite, now);
 
     /*
      * OpenAI SDK 在这里只是 OpenAI-compatible 协议客户端。
@@ -58,8 +61,7 @@ export async function createProductionMemoryManager(
       client: embeddingApi,
       model: options.infrastructure.EMBEDDING_MODEL,
       dimension: options.infrastructure.EMBEDDING_DIMENSION,
-      sendDimensions:
-        options.infrastructure.EMBEDDING_SEND_DIMENSIONS,
+      sendDimensions: options.infrastructure.EMBEDDING_SEND_DIMENSIONS,
     });
 
     const qdrant = new QdrantClient({
@@ -91,18 +93,27 @@ export async function createProductionMemoryManager(
     await graph.initialize();
     const extractor = new RuleBasedKnowledgeExtractor();
 
+    const consistencyScanner = new MemoryConsistencyScanner(
+      documents,
+      vectors,
+      graph,
+      embeddings,
+    );
+    const outboxWorker = new MemoryOutboxWorker(
+      consistencyOutbox,
+      documents,
+      vectors,
+      graph,
+      embeddings,
+      options.infrastructure.MEMORY_OUTBOX_MAX_ATTEMPTS,
+    );
+
     const manager = new MemoryManager(
       options.userId,
       [
         new WorkingMemory(memoryConfig, now),
         new EpisodicMemory(documents, vectors, embeddings, now),
-        new SemanticMemory(
-          documents,
-          vectors,
-          embeddings,
-          graph,
-          extractor,
-        ),
+        new SemanticMemory(documents, vectors, embeddings, graph, extractor),
         new PerceptualMemory(documents, vectors, embeddings, now),
       ],
       memoryConfig,
@@ -113,14 +124,23 @@ export async function createProductionMemoryManager(
 
     return {
       manager,
+      consistencyScanner,
+      consistencyOutbox,
+      outboxWorker,
       async close(): Promise<void> {
-        await driver.close();
-        sqlite.close();
+        try {
+          await driver.close();
+        } finally {
+          sqlite.close();
+        }
       },
     };
   } catch (error: unknown) {
-    if (neo4jDriver) await neo4jDriver.close();
-    sqlite.close();
+    try {
+      if (neo4jDriver) await neo4jDriver.close();
+    } finally {
+      sqlite.close();
+    }
     throw error;
   }
 }
