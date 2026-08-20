@@ -30,3 +30,29 @@ export type {
   MemoryType,
   RetrieveMemoriesInput,
 } from "./schemas.js";
+
+export {
+  createProductionMemoryManager,
+} from "./create-production-memory-manager.js";
+export type {
+  CreateProductionMemoryManagerOptions,
+  ProductionMemoryRuntime,
+} from "./create-production-memory-manager.js";
+export {
+  loadProductionMemoryConfig,
+} from "./production-memory-config.js";
+export type {
+  ProductionMemoryConfig,
+} from "./production-memory-config.js";
+export {
+  OpenAiCompatibleEmbeddingClient,
+} from "./openai-compatible-embedding.js";
+export {
+  SqliteDocumentStore,
+} from "./storage/sqlite-document-store.js";
+export {
+  QdrantVectorStore,
+} from "./storage/qdrant-vector-store.js";
+export {
+  Neo4jGraphStore,
+} from "./storage/neo4j-graph-store.js";
