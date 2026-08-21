@@ -2,10 +2,13 @@ import type { RagChunk, RagDocument, RagStats } from "../schemas.js";
 
 export interface RagDocumentStore {
   initialize(): Promise<void>;
-  getDocument(documentId: string): Promise<RagDocument | undefined>;
-  getChunksByDocument(documentId: string): Promise<RagChunk[]>;
-  getChunksByIds(chunkIds: string[]): Promise<RagChunk[]>;
+  getDocument(
+    namespace: string,
+    documentId: string,
+  ): Promise<RagDocument | undefined>;
+  getChunksByDocument(namespace: string, documentId: string): Promise<RagChunk[]>;
+  getChunksByIds(namespace: string, chunkIds: string[]): Promise<RagChunk[]>;
   replaceDocument(document: RagDocument, chunks: RagChunk[]): Promise<void>;
-  deleteDocument(documentId: string): Promise<boolean>;
+  deleteDocument(namespace: string, documentId: string): Promise<boolean>;
   getStats(namespace: string): Promise<RagStats>;
 }

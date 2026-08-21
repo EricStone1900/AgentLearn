@@ -11,6 +11,7 @@ function createDocument(namespace = "docs"): RagDocument {
     title: namespace,
     markdown: "# 标题\n\n正文",
     contentHash: "document-hash",
+    indexFingerprint: "index-v1",
     metadata: { category: "guide" },
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
@@ -60,8 +61,10 @@ describe("SqliteRagDocumentStore", () => {
     ];
     await store.replaceDocument(document, chunks);
 
-    await expect(store.getDocument(document.id)).resolves.toEqual(document);
-    await expect(store.getChunksByDocument(document.id)).resolves.toEqual(chunks);
+    await expect(store.getDocument(document.namespace, document.id))
+      .resolves.toEqual(document);
+    await expect(store.getChunksByDocument(document.namespace, document.id))
+      .resolves.toEqual(chunks);
   });
 
   it("再次 replace 会原子替换旧 chunks", async () => {
@@ -75,9 +78,15 @@ describe("SqliteRagDocumentStore", () => {
     };
     await store.replaceDocument(updated, [createChunk(updated, "new", 0)]);
 
-    expect((await store.getChunksByDocument(document.id)).map((item) => item.id))
+    expect((await store.getChunksByDocument(
+      document.namespace,
+      document.id,
+    )).map((item) => item.id))
       .toEqual(["new"]);
-    expect((await store.getDocument(document.id))?.contentHash).toBe("new-hash");
+    expect((await store.getDocument(
+      document.namespace,
+      document.id,
+    ))?.contentHash).toBe("new-hash");
   });
 
   it("getChunksByIds 保持调用方顺序", async () => {
@@ -86,15 +95,20 @@ describe("SqliteRagDocumentStore", () => {
       createChunk(document, "first", 0),
       createChunk(document, "second", 1),
     ]);
-    expect((await store.getChunksByIds(["second", "first"])).map((item) => item.id))
+    expect((await store.getChunksByIds(
+      document.namespace,
+      ["second", "first"],
+    )).map((item) => item.id))
       .toEqual(["second", "first"]);
   });
 
   it("删除文档会级联删除 chunks", async () => {
     const document = createDocument();
     await store.replaceDocument(document, [createChunk(document, "chunk", 0)]);
-    await expect(store.deleteDocument(document.id)).resolves.toBe(true);
-    await expect(store.getChunksByDocument(document.id)).resolves.toEqual([]);
+    await expect(store.deleteDocument(document.namespace, document.id))
+      .resolves.toBe(true);
+    await expect(store.getChunksByDocument(document.namespace, document.id))
+      .resolves.toEqual([]);
   });
 
   it("按 namespace 统计", async () => {
@@ -114,6 +128,55 @@ describe("SqliteRagDocumentStore", () => {
     await store.replaceDocument(document, []);
     database.prepare("UPDATE rag_documents SET metadata_json = ? WHERE id = ?")
       .run("not-json", document.id);
-    await expect(store.getDocument(document.id)).rejects.toThrow();
+    await expect(store.getDocument(document.namespace, document.id))
+      .rejects.toThrow();
+  });
+
+  it("删除时按 namespace 隔离", async () => {
+    const document = createDocument("private");
+    await store.replaceDocument(document, [createChunk(document, "chunk", 0)]);
+
+    await expect(store.deleteDocument("other", document.id)).resolves.toBe(false);
+    await expect(store.getDocument("private", document.id)).resolves.toEqual(document);
+  });
+
+  it("拒绝用同一文档 ID 覆盖其他 namespace", async () => {
+    const first = createDocument("first");
+    const second = {
+      ...createDocument("second"),
+      id: first.id,
+    };
+    await store.replaceDocument(first, []);
+
+    await expect(store.replaceDocument(second, []))
+      .rejects.toThrow("已属于 namespace first");
+  });
+
+  it("为旧表迁移 index_fingerprint 列", async () => {
+    const legacyDatabase = new Database(":memory:");
+    try {
+      legacyDatabase.exec(`
+        CREATE TABLE rag_documents (
+          id TEXT PRIMARY KEY,
+          namespace TEXT NOT NULL,
+          source TEXT NOT NULL,
+          title TEXT NOT NULL,
+          markdown TEXT NOT NULL,
+          content_hash TEXT NOT NULL,
+          metadata_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(namespace, source)
+        );
+      `);
+      const legacyStore = new SqliteRagDocumentStore(legacyDatabase);
+      await legacyStore.initialize();
+      const columns = legacyDatabase
+        .prepare("PRAGMA table_info(rag_documents)")
+        .all() as Array<{ name: string }>;
+      expect(columns.map((column) => column.name)).toContain("index_fingerprint");
+    } finally {
+      legacyDatabase.close();
+    }
   });
 });

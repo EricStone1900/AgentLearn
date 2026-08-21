@@ -51,22 +51,28 @@ class FakeDocuments implements RagDocumentStore {
   public failReplace = false;
 
   public async initialize(): Promise<void> {}
-  public async getDocument(): Promise<RagDocument | undefined> {
-    return this.document;
+  public async getDocument(namespace: string): Promise<RagDocument | undefined> {
+    return this.document?.namespace === namespace ? this.document : undefined;
   }
-  public async getChunksByDocument(): Promise<RagChunk[]> {
-    return [...this.chunks];
+  public async getChunksByDocument(namespace: string): Promise<RagChunk[]> {
+    return this.chunks.filter((chunk) => chunk.namespace === namespace);
   }
-  public async getChunksByIds(ids: string[]): Promise<RagChunk[]> {
-    return ids.flatMap((id) => this.chunks.filter((chunk) => chunk.id === id));
+  public async getChunksByIds(
+    namespace: string,
+    ids: string[],
+  ): Promise<RagChunk[]> {
+    return ids.flatMap((id) => this.chunks.filter(
+      (chunk) => chunk.namespace === namespace && chunk.id === id,
+    ));
   }
   public async replaceDocument(document: RagDocument, chunks: RagChunk[]): Promise<void> {
     if (this.failReplace) throw new Error("sqlite failed");
     this.document = document;
     this.chunks = [...chunks];
   }
-  public async deleteDocument(): Promise<boolean> {
-    const existed = this.document !== undefined;
+  public async deleteDocument(namespace: string): Promise<boolean> {
+    const existed = this.document?.namespace === namespace;
+    if (!existed) return false;
     this.document = undefined;
     this.chunks = [];
     return existed;
@@ -117,15 +123,17 @@ function createFixture() {
   const documents = new FakeDocuments();
   const vectors = new FakeVectors();
   const embeddings = new CountingEmbeddings();
+  const splitter = new MarkdownSplitter({ chunkTokens: 8, overlapTokens: 0 });
   const pipeline = new RagIngestionPipeline(
     loader,
-    new MarkdownSplitter({ chunkTokens: 8, overlapTokens: 0 }),
+    splitter,
     documents,
     vectors,
     embeddings,
+    "index-v1",
     () => new Date("2026-01-01T00:00:00.000Z"),
   );
-  return { loader, documents, vectors, embeddings, pipeline };
+  return { loader, documents, vectors, embeddings, splitter, pipeline };
 }
 
 describe("RagIngestionPipeline", () => {
@@ -144,6 +152,28 @@ describe("RagIngestionPipeline", () => {
     const second = await fixture.pipeline.ingestFile("guide.md", { namespace: "docs" });
     expect(second.replaced).toBe(false);
     expect(fixture.embeddings.batchCalls).toBe(1);
+  });
+
+  it("indexFingerprint 变化时会重新生成索引", async () => {
+    const fixture = createFixture();
+    await fixture.pipeline.ingestFile("guide.md", { namespace: "docs" });
+    const upgradedPipeline = new RagIngestionPipeline(
+      fixture.loader,
+      fixture.splitter,
+      fixture.documents,
+      fixture.vectors,
+      fixture.embeddings,
+      "index-v2",
+      () => new Date("2026-01-02T00:00:00.000Z"),
+    );
+
+    const result = await upgradedPipeline.ingestFile("guide.md", {
+      namespace: "docs",
+    });
+
+    expect(result.replaced).toBe(true);
+    expect(fixture.embeddings.batchCalls).toBe(2);
+    expect(fixture.documents.document?.indexFingerprint).toBe("index-v2");
   });
 
   it("文档更新后删除旧的 stale IDs", async () => {
@@ -176,8 +206,17 @@ describe("RagIngestionPipeline", () => {
     const fixture = createFixture();
     await fixture.pipeline.ingestFile("guide.md", { namespace: "docs" });
     fixture.vectors.failDelete = true;
-    await expect(fixture.pipeline.deleteDocument("document-id"))
+    await expect(fixture.pipeline.deleteDocument("docs", "document-id"))
       .rejects.toThrow("delete failed");
+    expect(fixture.documents.document).toBeDefined();
+  });
+
+  it("不能跨 namespace 删除文档", async () => {
+    const fixture = createFixture();
+    await fixture.pipeline.ingestFile("guide.md", { namespace: "docs" });
+
+    await expect(fixture.pipeline.deleteDocument("other", "document-id"))
+      .resolves.toBe(false);
     expect(fixture.documents.document).toBeDefined();
   });
 });

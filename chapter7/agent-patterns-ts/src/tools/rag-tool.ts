@@ -37,6 +37,22 @@ const ragToolInputSchema = z.object({
 
 type RagToolInput = z.infer<typeof ragToolInputSchema>;
 
+function toSearchOutput(
+  results: Awaited<ReturnType<RagToolService["search"]>>,
+): Array<Record<string, unknown>> {
+  return results.map(({ chunk, document, score }) => ({
+    chunkId: chunk.id,
+    documentId: document.id,
+    content: chunk.content,
+    source: document.source,
+    title: document.title,
+    ...(chunk.headingPath ? { headingPath: chunk.headingPath } : {}),
+    startOffset: chunk.startOffset,
+    endOffset: chunk.endOffset,
+    score,
+  }));
+}
+
 export function createRagTool(service: RagToolService): Tool<RagToolInput> {
   return {
     name: "rag",
@@ -62,17 +78,20 @@ export function createRagTool(service: RagToolService): Tool<RagToolInput> {
             namespace: input.namespace,
             ...(input.documentId ? { documentId: input.documentId } : {}),
           }), null, 2);
-        case "search":
+        case "search": {
+          const results = await service.search(input.query ?? "", {
+            namespace: input.namespace,
+            limit: input.limit,
+            ...(input.minScore === undefined ? {} : { minScore: input.minScore }),
+            enableMqe: input.enableMqe,
+            enableHyde: input.enableHyde,
+          });
+
           return JSON.stringify({
             success: true,
-            results: await service.search(input.query ?? "", {
-              namespace: input.namespace,
-              limit: input.limit,
-              ...(input.minScore === undefined ? {} : { minScore: input.minScore }),
-              enableMqe: input.enableMqe,
-              enableHyde: input.enableHyde,
-            }),
+            results: toSearchOutput(results),
           }, null, 2);
+        }
         case "ask":
           return JSON.stringify(await service.ask(input.query ?? "", {
             namespace: input.namespace,
@@ -84,7 +103,10 @@ export function createRagTool(service: RagToolService): Tool<RagToolInput> {
           }), null, 2);
         case "delete":
           return JSON.stringify({
-            success: await service.deleteDocument(input.documentId ?? ""),
+            success: await service.deleteDocument(
+              input.namespace,
+              input.documentId ?? "",
+            ),
           }, null, 2);
         case "stats":
           return JSON.stringify({

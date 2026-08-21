@@ -10,10 +10,20 @@ export interface RagAskResult {
   citations: ReturnType<typeof buildRagContext>["citations"];
 }
 
+export type RagIngestionService = Pick<
+  RagIngestionPipeline,
+  "ingestFile" | "ingestText" | "deleteDocument"
+>;
+
+export type RagRetrievalService = Pick<
+  RagRetriever,
+  "search" | "searchAdvanced"
+>;
+
 export class RagService {
   public constructor(
-    private readonly ingestion: RagIngestionPipeline,
-    private readonly retriever: RagRetriever,
+    private readonly ingestion: RagIngestionService,
+    private readonly retriever: RagRetrievalService,
     private readonly documents: RagDocumentStore,
     private readonly llm: LlmClient,
   ) {}
@@ -32,8 +42,8 @@ export class RagService {
       : this.retriever.search(query, options);
   }
 
-  public deleteDocument(documentId: string) {
-    return this.ingestion.deleteDocument(documentId);
+  public deleteDocument(namespace: string, documentId: string) {
+    return this.ingestion.deleteDocument(namespace, documentId);
   }
 
   public getStats(namespace: string) {

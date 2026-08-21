@@ -4,6 +4,7 @@ import OpenAI from "openai";
 import type { LlmClient } from "../core/types.js";
 import { OpenAiCompatibleEmbeddingClient } from "../memory/openai-compatible-embedding.js";
 import { LocalDocumentLoader } from "./document-loader.js";
+import { createRagIndexFingerprint } from "./ids.js";
 import { RagIngestionPipeline } from "./ingestion-pipeline.js";
 import { MarkdownSplitter } from "./markdown-splitter.js";
 import type { ProductionRagConfig } from "./production-rag-config.js";
@@ -51,7 +52,20 @@ export async function createProductionRag(
       overlapTokens: config.RAG_CHUNK_OVERLAP_TOKENS,
     });
     const ingestion = new RagIngestionPipeline(
-      loader, splitter, documents, vectors, embeddings,
+      loader,
+      splitter,
+      documents,
+      vectors,
+      embeddings,
+      createRagIndexFingerprint({
+        collectionName: config.RAG_QDRANT_COLLECTION,
+        embeddingBaseUrl: config.EMBEDDING_BASE_URL,
+        embeddingModel: config.EMBEDDING_MODEL,
+        embeddingDimension: config.EMBEDDING_DIMENSION,
+        chunkTokens: config.RAG_CHUNK_TOKENS,
+        overlapTokens: config.RAG_CHUNK_OVERLAP_TOKENS,
+        preprocessingVersion: "markdown-clean-v1",
+      }),
     );
     const retriever = new RagRetriever(documents, vectors, embeddings, llm);
     return {

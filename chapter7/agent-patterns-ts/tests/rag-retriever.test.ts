@@ -8,6 +8,7 @@ import type { RagChunk, RagDocument } from "../src/rag/schemas.js";
 const document: RagDocument = {
   id: "doc-1", namespace: "docs", source: "guide.md", title: "guide",
   markdown: "RAG 使用向量检索", contentHash: "h", metadata: {},
+  indexFingerprint: "index-v1",
   createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z",
 };
 const chunk: RagChunk = {
@@ -18,9 +19,15 @@ const chunk: RagChunk = {
 
 const documents: RagDocumentStore = {
   async initialize() {},
-  async getDocument(id) { return id === document.id ? document : undefined; },
+  async getDocument(namespace, id) {
+    return namespace === document.namespace && id === document.id
+      ? document
+      : undefined;
+  },
   async getChunksByDocument() { return [chunk]; },
-  async getChunksByIds(ids) { return ids.includes(chunk.id) ? [chunk] : []; },
+  async getChunksByIds(namespace, ids) {
+    return namespace === chunk.namespace && ids.includes(chunk.id) ? [chunk] : [];
+  },
   async replaceDocument() {},
   async deleteDocument() { return true; },
   async getStats() { return { documents: 1, chunks: 1 }; },

@@ -34,3 +34,27 @@ export function createChunkId(
     `rag-chunk:${documentId}:${chunkIndex}:${contentHash}`,
   );
 }
+
+export interface RagIndexFingerprintInput {
+  collectionName: string;
+  embeddingBaseUrl: string;
+  embeddingModel: string;
+  embeddingDimension: number;
+  chunkTokens: number;
+  overlapTokens: number;
+  preprocessingVersion: string;
+}
+
+export function createRagIndexFingerprint(
+  input: RagIndexFingerprintInput,
+): string {
+  return sha256(JSON.stringify([
+    input.collectionName,
+    input.embeddingBaseUrl,
+    input.embeddingModel,
+    input.embeddingDimension,
+    input.chunkTokens,
+    input.overlapTokens,
+    input.preprocessingVersion,
+  ]));
+}

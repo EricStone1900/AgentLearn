@@ -120,12 +120,18 @@ export class QdrantRagVectorStore implements RagVectorStore {
     });
   }
 
-  public async deleteByDocumentId(documentId: string): Promise<void> {
+  public async deleteByDocumentId(
+    namespace: string,
+    documentId: string,
+  ): Promise<void> {
     await this.ready;
     await this.options.client.delete(this.options.collectionName, {
       wait: true,
       filter: {
-        must: [{ key: "documentId", match: { value: documentId } }],
+        must: [
+          { key: "namespace", match: { value: namespace } },
+          { key: "documentId", match: { value: documentId } },
+        ],
       },
     });
   }

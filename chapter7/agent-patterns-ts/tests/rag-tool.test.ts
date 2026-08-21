@@ -3,6 +3,34 @@ import type { RagToolService } from "../src/tools/rag-tool.js";
 import { createRagTool } from "../src/tools/rag-tool.js";
 import { ToolRegistry } from "../src/tools/tool.js";
 
+const searchDocument = {
+  id: "doc-1",
+  namespace: "manual",
+  source: "guide.md",
+  title: "Guide",
+  markdown: "这是一整篇不应返回给工具的文档",
+  contentHash: "document-hash",
+  indexFingerprint: "index-v1",
+  metadata: {},
+  createdAt: "2026-01-01T00:00:00.000Z",
+  updatedAt: "2026-01-01T00:00:00.000Z",
+};
+
+const searchChunk = {
+  id: "chunk-1",
+  documentId: "doc-1",
+  namespace: "manual",
+  chunkIndex: 0,
+  content: "只返回相关片段",
+  embeddingText: "只返回相关片段",
+  headingPath: "检索",
+  startOffset: 10,
+  endOffset: 18,
+  tokenCount: 8,
+  contentHash: "chunk-hash",
+  metadata: {},
+};
+
 function createFakeService(): RagToolService {
   return {
     ingestText: vi.fn(async () => ({
@@ -11,7 +39,11 @@ function createFakeService(): RagToolService {
     ingestFile: vi.fn(async () => ({
       documentId: "doc-2", chunkCount: 3, replaced: false,
     })),
-    search: vi.fn(async () => []),
+    search: vi.fn(async () => [{
+      chunk: searchChunk,
+      document: searchDocument,
+      score: 0.91,
+    }]),
     ask: vi.fn(async () => ({ answer: "回答", citations: [] })),
     deleteDocument: vi.fn(async () => true),
     getStats: vi.fn(async () => ({ documents: 1, chunks: 2 })),
@@ -54,6 +86,38 @@ describe("RAGTool", () => {
       enableMqe: true,
       enableHyde: false,
     });
+
+    if (!result.ok) throw new Error(result.error);
+    const output = JSON.parse(result.output) as {
+      results: Array<Record<string, unknown>>;
+    };
+    expect(output.results).toEqual([{
+      chunkId: "chunk-1",
+      documentId: "doc-1",
+      content: "只返回相关片段",
+      source: "guide.md",
+      title: "Guide",
+      headingPath: "检索",
+      startOffset: 10,
+      endOffset: 18,
+      score: 0.91,
+    }]);
+    expect(result.output).not.toContain(searchDocument.markdown);
+  });
+
+  it("delete 转发 namespace 和 documentId", async () => {
+    const service = createFakeService();
+    const registry = new ToolRegistry();
+    registry.register(createRagTool(service));
+
+    const result = await registry.executeDetailed("rag", {
+      action: "delete",
+      namespace: "private",
+      documentId: "doc-1",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(service.deleteDocument).toHaveBeenCalledWith("private", "doc-1");
   });
 
   it("stats 返回可解析 JSON", async () => {

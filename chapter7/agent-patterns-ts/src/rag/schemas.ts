@@ -9,6 +9,7 @@ export interface RagDocument {
   title: string;
   markdown: string;
   contentHash: string;
+  indexFingerprint: string;
   metadata: Record<string, unknown>;
   createdAt: string;
   updatedAt: string;

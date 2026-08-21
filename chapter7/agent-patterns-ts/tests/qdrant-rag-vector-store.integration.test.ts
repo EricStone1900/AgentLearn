@@ -7,16 +7,28 @@ const enabled = process.env.RUN_RAG_INTEGRATION_TESTS === "true";
 const suite = enabled ? describe : describe.skip;
 
 suite("QdrantRagVectorStore integration", () => {
-  const client = new QdrantClient({ url: process.env.QDRANT_URL ?? "http://localhost:6333" });
   const collectionName = `rag_test_${randomUUID().replaceAll("-", "")}`;
-  const store = new QdrantRagVectorStore({ client, collectionName, dimension: 4 });
+  let client: QdrantClient;
+  let store: QdrantRagVectorStore;
+  let initialized = false;
 
   beforeAll(async () => {
+    client = new QdrantClient({
+      url: process.env.QDRANT_URL ?? "http://localhost:6333",
+    });
+    store = new QdrantRagVectorStore({
+      client,
+      collectionName,
+      dimension: 4,
+    });
     await store.initialize();
+    initialized = true;
   });
 
   afterAll(async () => {
-    await client.deleteCollection(collectionName);
+    if (initialized) {
+      await client.deleteCollection(collectionName);
+    }
   });
 
   it("按 namespace 隔离检索并按 documentId 删除", async () => {
@@ -30,8 +42,13 @@ suite("QdrantRagVectorStore integration", () => {
     const hits = await store.search([1, 0, 0, 0], { namespace: "a", limit: 10 });
     expect(hits.map((hit) => hit.chunkId)).toEqual([firstId]);
 
-    await store.deleteByDocumentId("doc-a");
+    await store.deleteByDocumentId("a", "doc-a");
     await expect(store.search([1, 0, 0, 0], { namespace: "a", limit: 10 }))
       .resolves.toEqual([]);
+    const remaining = await store.search(
+      [1, 0, 0, 0],
+      { namespace: "b", limit: 10 },
+    );
+    expect(remaining.map((hit) => hit.chunkId)).toEqual([secondId]);
   });
 });

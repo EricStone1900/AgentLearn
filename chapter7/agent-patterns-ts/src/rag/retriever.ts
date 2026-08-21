@@ -30,7 +30,7 @@ export class RagRetriever {
       ...(options.minScore === undefined ? {} : { minScore: options.minScore }),
       ...(options.documentId ? { documentId: options.documentId } : {}),
     });
-    return this.hydrate(hits);
+    return this.hydrate(options.namespace, hits);
   }
 
   public async searchAdvanced(
@@ -40,11 +40,27 @@ export class RagRetriever {
     if (!options.enableMqe && !options.enableHyde) return this.search(query, options);
     if (!this.llm) throw new Error("高级 RAG 检索需要 LlmClient");
 
-    const expansions = [query];
+    const normalizedQuery = query.trim();
+    if (!normalizedQuery) throw new Error("RAG 查询不能为空");
+
+    const expansions = [normalizedQuery];
     if (options.enableMqe) {
-      expansions.push(...await this.expandQueries(query, options.mqeExpansions ?? 2));
+      try {
+        expansions.push(...await this.expandQueries(
+          normalizedQuery,
+          options.mqeExpansions ?? 2,
+        ));
+      } catch {
+        // 查询扩展失败时仍使用原始查询，避免高级检索整体不可用。
+      }
     }
-    if (options.enableHyde) expansions.push(await this.createHydeDocument(query));
+    if (options.enableHyde) {
+      try {
+        expansions.push(await this.createHydeDocument(normalizedQuery));
+      } catch {
+        // HyDE 失败时退回原始查询和已经成功生成的 MQE 查询。
+      }
+    }
     const unique = [...new Set(expansions.map((item) => item.trim()).filter(Boolean))];
     const limit = options.limit ?? 5;
     const pool = Math.max(limit * (options.candidatePoolMultiplier ?? 4), 20);
@@ -66,24 +82,30 @@ export class RagRetriever {
       if (!previous || hit.score > previous.score) best.set(hit.chunkId, hit);
     }
     const merged = [...best.values()].sort((a, b) => b.score - a.score).slice(0, limit);
-    return this.hydrate(merged);
+    return this.hydrate(options.namespace, merged);
   }
 
   private async hydrate(
+    namespace: string,
     hits: Array<{ chunkId: string; score: number }>,
   ): Promise<RagSearchResult[]> {
-    const chunks = await this.documents.getChunksByIds(hits.map((hit) => hit.chunkId));
+    const chunks = await this.documents.getChunksByIds(
+      namespace,
+      hits.map((hit) => hit.chunkId),
+    );
     const chunksById = new Map(chunks.map((chunk) => [chunk.id, chunk]));
     const documentIds = [...new Set(chunks.map((chunk) => chunk.documentId))];
     const documentPairs = await Promise.all(documentIds.map(async (id) => {
-      return [id, await this.documents.getDocument(id)] as const;
+      return [id, await this.documents.getDocument(namespace, id)] as const;
     }));
     const documentsById = new Map(documentPairs);
 
     return hits.flatMap((hit) => {
       const chunk = chunksById.get(hit.chunkId);
       const document = chunk ? documentsById.get(chunk.documentId) : undefined;
-      return chunk && document ? [{ chunk, document, score: hit.score }] : [];
+      return chunk?.namespace === namespace && document?.namespace === namespace
+        ? [{ chunk, document, score: hit.score }]
+        : [];
     });
   }
 

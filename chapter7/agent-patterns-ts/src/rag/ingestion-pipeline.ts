@@ -12,8 +12,13 @@ export class RagIngestionPipeline {
     private readonly documents: RagDocumentStore,
     private readonly vectors: RagVectorStore,
     private readonly embeddings: EmbeddingClient,
+    private readonly indexFingerprint: string,
     private readonly now: () => Date = () => new Date(),
-  ) {}
+  ) {
+    if (!indexFingerprint.trim()) {
+      throw new Error("RAG indexFingerprint 不能为空");
+    }
+  }
 
   public async ingestFile(
     filePath: string,
@@ -31,13 +36,22 @@ export class RagIngestionPipeline {
   }
 
   private async ingestLoaded(loaded: LoadedRagDocument): Promise<RagIngestionResult> {
-    const previous = await this.documents.getDocument(loaded.id);
-    if (previous?.contentHash === loaded.contentHash) {
-      const existingChunks = await this.documents.getChunksByDocument(loaded.id);
+    const previous = await this.documents.getDocument(loaded.namespace, loaded.id);
+    if (
+      previous?.contentHash === loaded.contentHash &&
+      previous.indexFingerprint === this.indexFingerprint
+    ) {
+      const existingChunks = await this.documents.getChunksByDocument(
+        loaded.namespace,
+        loaded.id,
+      );
       return { documentId: loaded.id, chunkCount: existingChunks.length, replaced: false };
     }
 
-    const oldChunks = await this.documents.getChunksByDocument(loaded.id);
+    const oldChunks = await this.documents.getChunksByDocument(
+      loaded.namespace,
+      loaded.id,
+    );
     const chunks = this.splitter.split(loaded);
     if (chunks.length === 0) throw new Error("文档切分后没有有效 chunk");
 
@@ -69,6 +83,7 @@ export class RagIngestionPipeline {
     const timestamp = this.now().toISOString();
     const document: RagDocument = {
       ...loaded,
+      indexFingerprint: this.indexFingerprint,
       createdAt: previous?.createdAt ?? timestamp,
       updatedAt: timestamp,
     };
@@ -86,12 +101,20 @@ export class RagIngestionPipeline {
     return { documentId: loaded.id, chunkCount: chunks.length, replaced: previous !== undefined };
   }
 
-  public async deleteDocument(documentId: string): Promise<boolean> {
-    const chunks = await this.documents.getChunksByDocument(documentId);
-    if (chunks.length === 0 && !(await this.documents.getDocument(documentId))) return false;
+  public async deleteDocument(
+    namespace: string,
+    documentId: string,
+  ): Promise<boolean> {
+    const chunks = await this.documents.getChunksByDocument(namespace, documentId);
+    if (
+      chunks.length === 0 &&
+      !(await this.documents.getDocument(namespace, documentId))
+    ) {
+      return false;
+    }
 
     // 先删 Qdrant；失败时保留 SQLite 权威文档，方便重试。
     await this.vectors.deleteChunkIds(chunks.map((chunk) => chunk.id));
-    return this.documents.deleteDocument(documentId);
+    return this.documents.deleteDocument(namespace, documentId);
   }
 }

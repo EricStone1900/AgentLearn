@@ -9,6 +9,7 @@ interface DocumentRow {
   title: string;
   markdown: string;
   content_hash: string;
+  index_fingerprint: string;
   metadata_json: string;
   created_at: string;
   updated_at: string;
@@ -41,6 +42,7 @@ function toDocument(row: DocumentRow): RagDocument {
     title: row.title,
     markdown: row.markdown,
     contentHash: row.content_hash,
+    indexFingerprint: row.index_fingerprint,
     metadata: parseMetadata(row.metadata_json),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -77,6 +79,7 @@ export class SqliteRagDocumentStore implements RagDocumentStore {
         title TEXT NOT NULL,
         markdown TEXT NOT NULL,
         content_hash TEXT NOT NULL,
+        index_fingerprint TEXT NOT NULL DEFAULT 'legacy',
         metadata_json TEXT NOT NULL,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
@@ -106,28 +109,53 @@ export class SqliteRagDocumentStore implements RagDocumentStore {
       CREATE INDEX IF NOT EXISTS idx_rag_chunks_namespace
         ON rag_chunks(namespace);
     `);
+
+    const columns = this.database
+      .prepare("PRAGMA table_info(rag_documents)")
+      .all() as Array<{ name: string }>;
+
+    if (!columns.some((column) => column.name === "index_fingerprint")) {
+      this.database.exec(
+        "ALTER TABLE rag_documents " +
+        "ADD COLUMN index_fingerprint TEXT NOT NULL DEFAULT 'legacy'",
+      );
+    }
   }
 
-  public async getDocument(documentId: string): Promise<RagDocument | undefined> {
+  public async getDocument(
+    namespace: string,
+    documentId: string,
+  ): Promise<RagDocument | undefined> {
     const row = this.database
-      .prepare("SELECT * FROM rag_documents WHERE id = ?")
-      .get(documentId) as DocumentRow | undefined;
+      .prepare("SELECT * FROM rag_documents WHERE namespace = ? AND id = ?")
+      .get(namespace, documentId) as DocumentRow | undefined;
     return row ? toDocument(row) : undefined;
   }
 
-  public async getChunksByDocument(documentId: string): Promise<RagChunk[]> {
+  public async getChunksByDocument(
+    namespace: string,
+    documentId: string,
+  ): Promise<RagChunk[]> {
     const rows = this.database
-      .prepare("SELECT * FROM rag_chunks WHERE document_id = ? ORDER BY chunk_index")
-      .all(documentId) as ChunkRow[];
+      .prepare(
+        "SELECT * FROM rag_chunks " +
+        "WHERE namespace = ? AND document_id = ? ORDER BY chunk_index",
+      )
+      .all(namespace, documentId) as ChunkRow[];
     return rows.map(toChunk);
   }
 
-  public async getChunksByIds(chunkIds: string[]): Promise<RagChunk[]> {
+  public async getChunksByIds(
+    namespace: string,
+    chunkIds: string[],
+  ): Promise<RagChunk[]> {
     if (chunkIds.length === 0) return [];
     const placeholders = chunkIds.map(() => "?").join(",");
     const rows = this.database
-      .prepare(`SELECT * FROM rag_chunks WHERE id IN (${placeholders})`)
-      .all(...chunkIds) as ChunkRow[];
+      .prepare(
+        `SELECT * FROM rag_chunks WHERE namespace = ? AND id IN (${placeholders})`,
+      )
+      .all(namespace, ...chunkIds) as ChunkRow[];
     const byId = new Map(rows.map((row) => [row.id, toChunk(row)]));
     return chunkIds.flatMap((id) => {
       const chunk = byId.get(id);
@@ -141,23 +169,34 @@ export class SqliteRagDocumentStore implements RagDocumentStore {
     }
 
     const replace = this.database.transaction(() => {
+      const existing = this.database
+        .prepare("SELECT namespace FROM rag_documents WHERE id = ?")
+        .get(document.id) as { namespace: string } | undefined;
+
+      if (existing && existing.namespace !== document.namespace) {
+        throw new Error(
+          `文档 ID ${document.id} 已属于 namespace ${existing.namespace}`,
+        );
+      }
+
       this.database.prepare(`
         INSERT INTO rag_documents (
-          id, namespace, source, title, markdown, content_hash,
+          id, namespace, source, title, markdown, content_hash, index_fingerprint,
           metadata_json, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           namespace = excluded.namespace,
           source = excluded.source,
           title = excluded.title,
           markdown = excluded.markdown,
           content_hash = excluded.content_hash,
+          index_fingerprint = excluded.index_fingerprint,
           metadata_json = excluded.metadata_json,
           updated_at = excluded.updated_at
       `).run(
         document.id, document.namespace, document.source, document.title,
-        document.markdown, document.contentHash, JSON.stringify(document.metadata),
-        document.createdAt, document.updatedAt,
+        document.markdown, document.contentHash, document.indexFingerprint,
+        JSON.stringify(document.metadata), document.createdAt, document.updatedAt,
       );
 
       this.database.prepare("DELETE FROM rag_chunks WHERE document_id = ?").run(document.id);
@@ -179,10 +218,13 @@ export class SqliteRagDocumentStore implements RagDocumentStore {
     replace();
   }
 
-  public async deleteDocument(documentId: string): Promise<boolean> {
+  public async deleteDocument(
+    namespace: string,
+    documentId: string,
+  ): Promise<boolean> {
     const result = this.database
-      .prepare("DELETE FROM rag_documents WHERE id = ?")
-      .run(documentId);
+      .prepare("DELETE FROM rag_documents WHERE namespace = ? AND id = ?")
+      .run(namespace, documentId);
     return result.changes > 0;
   }
 
