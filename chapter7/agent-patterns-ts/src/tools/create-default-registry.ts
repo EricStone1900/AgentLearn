@@ -3,11 +3,20 @@ import { advancedCalculatorTool } from "./advanced-calculator.js";
 import { createMemoryTool } from "./memory-tool.js";
 import { createHybridSearchToolFromEnv } from "./search/hybrid-search.js";
 import { ToolRegistry } from "./tool.js";
+import type { RagService } from "../rag/rag-service.js";
+import { createRagTool } from "./rag-tool.js";
 
 export interface CreateDefaultToolRegistryOptions {
   env?: NodeJS.ProcessEnv;
   includeSearch?: boolean;
   memoryManager?: MemoryManager;
+}
+
+export interface CreateDefaultToolRegistryOptions {
+  env?: NodeJS.ProcessEnv;
+  includeSearch?: boolean;
+  memoryManager?: MemoryManager;
+  ragService?: RagService;
 }
 
 /**
@@ -35,6 +44,10 @@ export function createDefaultToolRegistry(
 
   if (options.memoryManager) {
     registry.register(createMemoryTool(options.memoryManager));
+  }
+
+  if (options.ragService) {
+    registry.register(createRagTool(options.ragService));
   }
 
   return registry;

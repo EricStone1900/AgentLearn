@@ -23,7 +23,8 @@
     "memory:consistency": "npm run memory:consistency:scan",
     "memory:consistency:scan": "tsx src/examples/memory-consistency.ts",
     "memory:consistency:enqueue": "tsx src/examples/memory-consistency-enqueue.ts",
-    "memory:outbox:work": "tsx src/examples/memory-outbox-worker.ts"
+    "memory:outbox:work": "tsx src/examples/memory-outbox-worker.ts",
+    "test:rag:integration": "RUN_RAG_INTEGRATION_TESTS=true vitest run tests/*rag*.integration.test.ts"
   },
   "dependencies": {
     "@qdrant/js-client-rest": "^1.19.0",
