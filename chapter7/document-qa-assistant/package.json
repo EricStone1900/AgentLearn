@@ -5,7 +5,7 @@
   "description": "基于 Agent、RAG 和 Memory 的智能文档问答助手",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.13.0"
   },
   "scripts": {
     "clean": "node scripts/clean.mjs",
@@ -15,15 +15,23 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "check": "npm run typecheck && npm test && npm run build"
+    "check": "npm run typecheck && npm test && npm run build",
+    "verify:agent-package": "node scripts/verify-agent-package.mjs",
+    "verify:env": "tsx src/commands/verify-environment.ts",
+    "verify:pdf": "tsx src/commands/verify-pdf-converter.ts",
+    "verify:runtime": "tsx src/commands/verify-runtime.ts"
   },
   "dependencies": {
+    "@ericstone/agent-patterns-ts": "file:../agent-patterns-ts/ericstone-agent-patterns-ts-0.1.0.tgz",
+    "@fastify/multipart": "^10.1.1",
     "dotenv": "^17.4.2",
     "fastify": "^5.12.1",
+    "pdfjs-dist": "^6.2.108",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^26.2.0",
+    "pdf-lib": "^1.17.1",
     "tsx": "^4.23.12",
     "typescript": "^7.0.2",
     "vitest": "^4.1.11"
