@@ -1,13 +1,56 @@
 {
-  "name": "agent-patterns-ts",
+  "name": "@ericstone/agent-patterns-ts",
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./core": {
+      "types": "./dist/core/index.d.ts",
+      "import": "./dist/core/index.js"
+    },
+    "./agents": {
+      "types": "./dist/agents/index.d.ts",
+      "import": "./dist/agents/index.js"
+    },
+    "./tools": {
+      "types": "./dist/tools/index.d.ts",
+      "import": "./dist/tools/index.js"
+    },
+    "./memory": {
+      "types": "./dist/memory/index.d.ts",
+      "import": "./dist/memory/index.js"
+    },
+    "./rag": {
+      "types": "./dist/rag/index.d.ts",
+      "import": "./dist/rag/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "scripts": {
-    "dev": "tsx src/index.ts",
+    "clean": "node scripts/clean.mjs",
+    "build": "npm run clean && tsc -p tsconfig.build.json",
+    "verify:package": "npm run build && node scripts/verify-package.mjs",
+    "prepack": "npm run typecheck && npm test && npm run verify:package",
+
+    "dev": "tsx src/examples/project-overview.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+
     "demo:llm": "tsx src/examples/llm-client-demo.ts",
     "demo:react": "tsx src/examples/react-demo.ts",
     "demo:plan": "tsx src/examples/plan-and-solve-demo.ts",
@@ -16,18 +59,22 @@
     "demo:simple": "tsx src/examples/simple-agent-demo.ts",
     "demo:function-call": "tsx src/examples/function-call-agent-demo.ts",
     "demo:tools": "tsx src/examples/tool-system-demo.ts",
+
     "demo:memory:function": "tsx src/examples/memory-function-call-demo.ts",
     "demo:memory:tool": "tsx src/examples/memory-simple-agent-demo.ts",
     "demo:memory:production": "tsx src/examples/production-memory-demo.ts",
+
     "test:memory:integration": "RUN_MEMORY_INTEGRATION_TESTS=true vitest run tests/*.integration.test.ts",
     "memory:consistency": "npm run memory:consistency:scan",
     "memory:consistency:scan": "tsx src/examples/memory-consistency.ts",
     "memory:consistency:enqueue": "tsx src/examples/memory-consistency-enqueue.ts",
     "memory:outbox:work": "tsx src/examples/memory-outbox-worker.ts",
+
     "test:rag:integration": "RUN_RAG_INTEGRATION_TESTS=true vitest run tests/*rag*.integration.test.ts"
   },
   "dependencies": {
     "@qdrant/js-client-rest": "^1.19.0",
+    "@types/better-sqlite3": "^9.6.0",
     "better-sqlite3": "^13.0.3",
     "dotenv": "^17.4.2",
     "neo4j-driver": "^6.2.0",
@@ -35,7 +82,6 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^26.2.0",
     "tsx": "^4.23.12",
     "typescript": "^7.0.2",

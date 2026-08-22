@@ -10,12 +10,6 @@ export interface CreateDefaultToolRegistryOptions {
   env?: NodeJS.ProcessEnv;
   includeSearch?: boolean;
   memoryManager?: MemoryManager;
-}
-
-export interface CreateDefaultToolRegistryOptions {
-  env?: NodeJS.ProcessEnv;
-  includeSearch?: boolean;
-  memoryManager?: MemoryManager;
   ragService?: RagService;
 }
 
